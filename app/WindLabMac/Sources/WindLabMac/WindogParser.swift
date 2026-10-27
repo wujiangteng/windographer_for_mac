@@ -1,10 +1,13 @@
 import Foundation
+import WindogCore
 
-struct WindogSummary: Decodable {
+struct WindogSummary {
     let fileName: String
     let sections: [DecodedPropertySection]
     let charts: DecodedCharts
     let configuration: DecodedDataSetConfiguration?
+    let sourceData: WindExportDataSet
+    let analysisData: WindExportDataSet
 }
 
 struct DecodedPropertySection: Decodable {
@@ -171,37 +174,77 @@ struct DecodedDistributionRow: Decodable {
 }
 
 enum WindogParser {
-    static func parse(fileURL: URL) throws -> WindogSummary {
-        try runParser(arguments: [fileURL.path], outputType: WindogSummary.self)
+    static func exportDataSet(fileURL: URL, includingEmptyColumns: Bool = false) throws -> WindExportDataSet {
+        if fileURL.pathExtension.lowercased() == "windog" {
+            let document = try WindogDocument(contentsOf: fileURL)
+            return WindExportDataSet(name: fileURL.deletingPathExtension().lastPathComponent,
+                                     startDate: document.startDate, timeStepMinutes: document.timeStepMinutes,
+                                     columns: document.columns.filter { includingEmptyColumns || $0.count > 0 }.map { column in
+                WindExportColumn(id: column.channelID, label: column.name, unit: column.unit,
+                                 values: document.values(for: column).map { $0.isFinite ? Double($0) : nil },
+                                 height: WindColumnMetadata.height(in: column.name),
+                                 kind: WindColumnMetadata.kind(label: column.name, unit: column.unit),
+                                 subtype: WindColumnMetadata.subtype(in: column.name),
+                                 flagIntervals: try? document.flagIntervals(for: column))
+            }, flags: document.flags)
+        }
+        return try TextDataImporter.load(contentsOf: fileURL)
+    }
+
+    static func parse(fileURL: URL, configuration: DataSetConfiguration = .empty) throws -> WindogSummary {
+        try NativeSummaryAnalysis.build(dataset: exportDataSet(fileURL: fileURL),
+                                        configuration: configuration, fileName: fileURL.lastPathComponent)
     }
 
     static func parseTimeSeries(fileURL: URL, channelID: String, mode: String) throws -> DecodedSeries {
-        try runParser(arguments: ["--time-series", fileURL.path, mode, channelID], outputType: DecodedSeries.self)
+        try NativeTimeSeriesAnalysis.series(dataset: exportDataSet(fileURL: fileURL), channelID: channelID, mode: mode)
     }
 
     static func parseConfigurationPreview(fileURL: URL, channelID: String) throws -> DecodedColumnPreview {
-        try runParser(arguments: ["--config-preview", fileURL.path, channelID], outputType: DecodedColumnPreview.self)
+        try NativeConfigurationAnalysis.preview(dataset: exportDataSet(fileURL: fileURL, includingEmptyColumns: true), channelID: channelID)
     }
 
     static func parseConfiguration(fileURL: URL) throws -> DecodedDataSetConfiguration {
-        try runParser(arguments: ["--configuration", fileURL.path], outputType: DecodedDataSetConfiguration.self)
+        NativeConfigurationAnalysis.configuration(dataset: try exportDataSet(fileURL: fileURL, includingEmptyColumns: true), fileName: fileURL.lastPathComponent)
     }
 
     static func saveConfiguration(sourceURL: URL, destinationURL: URL, configuration: DataSetConfiguration) throws {
-        let encoder = JSONEncoder()
-        let payload = try encoder.encode(EncodableDataSetConfiguration(configuration))
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("windlab-save-\(UUID().uuidString)")
-            .appendingPathExtension("json")
-        try payload.write(to: temporaryURL, options: .atomic)
-        defer {
-            try? FileManager.default.removeItem(at: temporaryURL)
+        guard sourceURL.pathExtension.lowercased() == "windog" else {
+            throw ParserError.failed("Creating native .windog files from text is not supported yet. Open an existing .windog file to save changes.")
         }
-
-        _ = try runParser(
-            arguments: ["--save-config", sourceURL.path, destinationURL.path, temporaryURL.path],
-            outputType: SaveResult.self
-        )
+        let document = try WindogDocument(contentsOf: sourceURL)
+        let baseline = DataSetConfiguration(decoded: try parseConfiguration(fileURL: sourceURL))
+        // The configuration panel is loaded lazily. Save/Save As before opening
+        // it is a lossless copy, rather than an attempt to delete every column.
+        let configuration = configuration.columns.isEmpty && configuration.dataSet == .empty
+            ? baseline : configuration
+        // Unrecovered properties must not be silently dropped or written at guessed offsets.
+        func unsupportedProperties(_ value: DataSetConfiguration) throws -> NSDictionary {
+            let data = try JSONEncoder().encode(EncodableDataSetConfiguration(value))
+            var object = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            object["columns"] = (object["columns"] as! [[String: Any]]).map { item in
+                var properties = item
+                properties.removeValue(forKey: "label")
+                properties.removeValue(forKey: "unit")
+                return properties
+            }
+            return object as NSDictionary
+        }
+        guard try unsupportedProperties(configuration).isEqual(unsupportedProperties(baseline)) else {
+            throw ParserError.failed("Native saving currently supports column labels and units. Other edited properties cannot yet be saved to .windog.")
+        }
+        let baselineByID = Dictionary(uniqueKeysWithValues: baseline.columns.map { ($0.id, $0) })
+        let columnsByID = Dictionary(uniqueKeysWithValues: document.columns.map { ($0.channelID, $0) })
+        let edits = try configuration.columns.map { column -> WindogColumnEdit in
+            guard let original = columnsByID[column.id], let previous = baselineByID[column.id] else {
+                throw ParserError.failed("The source columns changed. Reopen the file before saving.")
+            }
+            // Analysis normalizes units. Leave the source representation untouched
+            // unless the user actually changed that field.
+            let unit = column.unit == previous.unit ? original.unit : column.unit
+            return WindogColumnEdit(index: original.index, name: column.label, unit: unit)
+        }
+        try document.applying(edits).write(to: destinationURL)
     }
 
     static func parseWindRose(
@@ -220,25 +263,35 @@ enum WindogParser {
         filterMin: String = "-",
         filterMax: String = "-"
     ) throws -> DecodedRoseChart {
-        try runParser(
-            arguments: [
-                "--wind-rose",
-                fileURL.path,
-                display,
-                versus,
-                String(sectors),
-                directionID,
-                dataIDs.isEmpty ? "-" : dataIDs.joined(separator: "\u{1f}"),
-                filterMode,
-                year,
-                month,
-                "\(rangeStart),\(rangeEnd)",
-                filterColumn,
-                filterMin,
-                filterMax
-            ],
-            outputType: DecodedRoseChart.self
-        )
+        let dataset = try exportDataSet(fileURL: fileURL)
+        let selection = try NativeHistogramAnalysis.legacySelection(filterMode: filterMode, year: year, month: month,
+            rangeStart: rangeStart, rangeEnd: rangeEnd, filterColumn: filterColumn, filterMin: filterMin, filterMax: filterMax)
+        let metric: RoseDisplay = switch display {
+        case "frequency": .frequency
+        case "mean": .mean
+        case "min": .minimum
+        case "max": .maximum
+        case "std. dev.": .standardDeviation
+        case "total energy": .totalEnergy
+        case "scatter plot": .scatter
+        default: .occurrences
+        }
+        let grouping: RoseGrouping = switch versus {
+        case "direction": .direction
+        case "direction and month": .month
+        case "direction and hour": .hour
+        case "direction and bin": .bin
+        default: .allDirections
+        }
+        let result = try WindRoseAnalysis.analyze(dataset, request: RoseRequest(
+            directionID: directionID.isEmpty ? nil : directionID, dataIDs: dataIDs,
+            grouping: grouping, display: metric, sectors: sectors, selection: selection))
+        return DecodedRoseChart(series: result.series.map { item in
+            DecodedPolarSeries(name: item.label, colorName: item.colorName ?? "accent", points:
+                zip(result.sectorCenters, item.sectorValues).map { angle, value in
+                    DecodedPolarPoint(degrees: angle, radius: value.map { item.unit == "%" ? $0 / 100 : $0 } ?? .nan)
+                })
+        })
     }
 
     static func parseHistogram(
@@ -254,26 +307,25 @@ enum WindogParser {
         rangeEnd: String,
         filterColumn: String,
         filterMin: String,
-        filterMax: String
+        filterMax: String,
+        halfFirstBin: Bool = false
     ) throws -> DecodedHistogram {
-        try runParser(
-            arguments: [
-                "--histogram",
-                fileURL.path,
-                display,
-                primaryID,
-                width,
-                start,
-                filterMode,
-                year,
-                month,
-                "\(rangeStart),\(rangeEnd)",
-                filterColumn,
-                filterMin,
-                filterMax
-            ],
-            outputType: DecodedHistogram.self
-        )
+        let dataset = try exportDataSet(fileURL: fileURL)
+        let selection = try NativeHistogramAnalysis.legacySelection(filterMode: filterMode, year: year, month: month,
+            rangeStart: rangeStart, rangeEnd: rangeEnd, filterColumn: filterColumn, filterMin: filterMin, filterMax: filterMax)
+        func number(_ text: String) throws -> Double? {
+            if text == "-" { return nil }
+            guard let value = Double(text), value.isFinite else { throw WindogError.invalid("Invalid bin setting") }
+            return value
+        }
+        let page = try NativeHistogramAnalysis.build(dataset: dataset, request: HistogramRequest(primaryID: primaryID,
+            primaryBins: HistogramBinSettings(width: try number(width), start: try number(start), halfFirst: halfFirstBin), selection: selection))
+        let frequency = display == "frequency"
+        return DecodedHistogram(bars: page.result.bins.indices.map {
+            DecodedHistogramBar(x: page.result.bins[$0].center,
+                                y: page.value(row: $0, group: 0, frequency: frequency, table: false), width: page.result.bins[$0].width)
+        }, curve: frequency ? page.curve.map { DecodedPoint(x: $0.x, y: $0.frequency) } : [],
+        xLabel: "\(page.primaryLabel) [\(page.primaryUnit)]", yLabel: frequency ? "Frequency (%)" : "Occurrences", weibull: page.fitLabel ?? "-")
     }
 
     static func parseDistributionAnalysis(
@@ -288,69 +340,14 @@ enum WindogParser {
         rangeEnd: String,
         filterColumn: String,
         filterMin: String,
-        filterMax: String
+        filterMax: String,
+        halfFirstBin: Bool = false
     ) throws -> DecodedDistributionAnalysis {
-        try runParser(
-            arguments: [
-                "--distribution-analysis",
-                fileURL.path,
-                primaryID,
-                width,
-                start,
-                filterMode,
-                year,
-                month,
-                "\(rangeStart),\(rangeEnd)",
-                filterColumn,
-                filterMin,
-                filterMax
-            ],
-            outputType: DecodedDistributionAnalysis.self
-        )
-    }
-
-    private static func runParser<T: Decodable>(arguments: [String], outputType: T.Type) throws -> T {
-        let sourceParserURL = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("Python")
-            .appendingPathComponent("parse_windog.py")
-        let packagedParserURL = Bundle.main.resourceURL?
-            .appendingPathComponent("WindLabMac_WindLabMac.bundle")
-            .appendingPathComponent("parse_windog.py")
-        let parserURL: URL
-        if FileManager.default.fileExists(atPath: sourceParserURL.path) {
-            parserURL = sourceParserURL
-        } else if let packagedParserURL, FileManager.default.fileExists(atPath: packagedParserURL.path) {
-            parserURL = packagedParserURL
-        } else {
-            parserURL = Bundle.module.url(forResource: "parse_windog", withExtension: "py", subdirectory: "Python")!
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        process.arguments = [parserURL.path] + arguments
-
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-
-        try process.run()
-        process.waitUntilExit()
-
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-
-        if process.terminationStatus != 0 {
-            let message = String(data: output + errorOutput, encoding: .utf8) ?? "Unknown parser error"
-            throw ParserError.failed(message)
-        }
-
-        if let envelope = try? JSONDecoder().decode(ParserErrorEnvelope.self, from: output), let error = envelope.error {
-            throw ParserError.failed(error)
-        }
-
-        return try JSONDecoder().decode(T.self, from: output)
+        let result = try NativeDistributionAnalysis.result(
+            fileURL: fileURL, primaryID: primaryID, width: width, start: start, halfFirstBin: halfFirstBin,
+            filterMode: filterMode, year: year, month: month, rangeStart: rangeStart, rangeEnd: rangeEnd,
+            filterColumn: filterColumn, filterMin: filterMin, filterMax: filterMax)
+        return NativeDistributionAnalysis.analysis(result)
     }
 
     enum ParserError: LocalizedError {
@@ -364,13 +361,7 @@ enum WindogParser {
         }
     }
 
-    private struct ParserErrorEnvelope: Decodable {
-        let error: String?
-    }
 
-    private struct SaveResult: Decodable {
-        let saved: Bool
-    }
 }
 
 private struct EncodableDataSetConfiguration: Encodable {

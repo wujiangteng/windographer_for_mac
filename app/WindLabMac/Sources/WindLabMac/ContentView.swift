@@ -1,15 +1,18 @@
 import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+import WindogCore
 
 struct ContentView: View {
     @EnvironmentObject private var fileOpenCoordinator: WindLabFileOpenCoordinator
 
     @State private var selectedTab = "Summary"
     @State private var propertySections: [PropertySection] = []
-    @State private var sourcePropertySections: [PropertySection] = []
+    @State private var rawSummaryData: WindExportDataSet?
+    @State private var timeSeriesSourceData: WindExportDataSet?
+    @State private var timeSeriesRevision = UUID()
+    @State private var summaryRequestID = UUID()
     @State private var chartData = AppChartData.sample
-    @State private var sourceChartData = AppChartData.sample
     @State private var loadedFileName = "No file loaded"
     @State private var parserError: String?
     @State private var isLoadingWindog = false
@@ -23,9 +26,13 @@ struct ContentView: View {
     @State private var isLoadingConfiguration = false
     @State private var dataSetConfiguration = DataSetConfiguration.empty
     @State private var pendingTextImportURL: URL?
+    @State private var pendingImportData: WindExportDataSet?
+    @State private var pendingImportConfiguration = DataSetConfiguration.empty
     @State private var lastOpenPanelRequestID = 0
     @State private var lastSaveRequestID = 0
     @State private var lastSaveAsRequestID = 0
+    @State private var lastExportRequestID = 0
+    @State private var showsExport = false
 
     private let tabs = ["Summary", "Time Series", "Wind Rose", "Diurnal Profile", "Histogram", "Scatter Plot", "Tables", "Reports"]
     private let toolbarItems: [(String, String)] = [
@@ -92,23 +99,31 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showsConfiguration) {
-            ConfigureDataSetView(configuration: dataSetConfiguration, fileURL: loadedFileURL) { updated in
-                applyConfiguration(updated)
+            ConfigureDataSetView(configuration: pendingTextImportURL == nil ? dataSetConfiguration : pendingImportConfiguration,
+                                 fileURL: pendingTextImportURL ?? loadedFileURL,
+                                 sourceData: pendingImportData ?? rawSummaryData) { updated in
                 showsConfiguration = false
-                if let pendingURL = pendingTextImportURL {
+                if let pendingURL = pendingTextImportURL, let source = pendingImportData {
                     pendingTextImportURL = nil
-                    loadWindog(pendingURL, preserveConfiguration: true)
+                    pendingImportData = nil
+                    pendingImportConfiguration = .empty
+                    installImportedData(source, url: pendingURL, configuration: updated)
+                } else {
+                    applyConfiguration(updated)
                 }
             } cancel: {
                 showsConfiguration = false
                 if pendingTextImportURL != nil {
                     pendingTextImportURL = nil
-                    loadedFileURL = nil
-                    loadedFileName = "No file loaded"
-                    dataSetConfiguration = .empty
+                    pendingImportData = nil
+                    pendingImportConfiguration = .empty
                 }
             }
-            .id(dataSetConfiguration.columns.map(\.id).joined(separator: "\u{1f}"))
+        }
+        .sheet(isPresented: $showsExport) {
+            if let loadedFileURL {
+                ExportDataView(fileURL: loadedFileURL, configuration: dataSetConfiguration) { showsExport = false }
+            }
         }
         .onAppear {
             openPendingWindogURL()
@@ -136,6 +151,11 @@ struct ContentView: View {
             lastSaveAsRequestID = requestID
             guard requestID > 0 else { return }
             saveWindogAs()
+        }
+        .onReceive(fileOpenCoordinator.$exportRequestID) { requestID in
+            guard requestID != lastExportRequestID else { return }
+            lastExportRequestID = requestID
+            if requestID > 0, hasLoadedFile, !isLoadingWindog { showsExport = true }
         }
     }
 
@@ -177,6 +197,9 @@ struct ContentView: View {
                 saveWindogAs()
             }
             .disabled(!canSaveAsWindog)
+
+            Button("Export Data…") { showsExport = true }
+                .disabled(!hasLoadedFile || isLoadingWindog)
 
             Menu("Open Recent") {
                 if fileOpenCoordinator.recentFiles.isEmpty {
@@ -317,35 +340,66 @@ struct ContentView: View {
     }
 
     private var canSaveAsWindog: Bool {
-        guard hasLoadedFile, let loadedFileURL else { return false }
-        return loadedFileURL.pathExtension.lowercased() == "windog" || isTextDataFile(loadedFileURL)
+        canSaveWindog
     }
 
     private func configureTextImport(_ fileURL: URL) {
         beginLoading(message: "Reading text data...")
         parserError = nil
-        hasLoadedFile = false
-        loadedFileName = fileURL.lastPathComponent
-        loadedFileURL = fileURL
-        pendingTextImportURL = fileURL
-        dataSetConfiguration = .empty
-
+        let requestID = UUID()
+        summaryRequestID = requestID
         Task.detached {
             do {
-                let decoded = try WindogParser.parseConfiguration(fileURL: fileURL)
+                let source = try WindogParser.exportDataSet(fileURL: fileURL)
+                let decoded = NativeConfigurationAnalysis.configuration(dataset: source, fileName: fileURL.lastPathComponent)
                 await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
                     completeLoading {
-                        dataSetConfiguration = DataSetConfiguration(decoded: decoded)
-                        fileOpenCoordinator.noteOpened(fileURL)
+                        guard summaryRequestID == requestID else { return }
+                        pendingImportData = source
+                        pendingImportConfiguration = DataSetConfiguration(decoded: decoded)
+                        pendingTextImportURL = fileURL
                         showsConfiguration = true
                     }
                 }
             } catch {
                 await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
+                    completeLoading { parserError = error.localizedDescription }
+                }
+            }
+        }
+    }
+
+    private func installImportedData(_ source: WindExportDataSet, url: URL, configuration: DataSetConfiguration) {
+        beginLoading(message: "Applying data configuration...")
+        let requestID = UUID()
+        summaryRequestID = requestID
+        Task.detached {
+            do {
+                let summary = try NativeSummaryAnalysis.build(dataset: source, configuration: configuration, fileName: url.lastPathComponent)
+                await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
                     completeLoading {
-                        parserError = error.localizedDescription
-                        pendingTextImportURL = nil
+                        guard summaryRequestID == requestID else { return }
+                        rawSummaryData = source
+                        dataSetConfiguration = configuration
+                        timeSeriesSourceData = summary.analysisData
+                        timeSeriesRevision = UUID()
+                        chartData = AppChartData(decoded: summary.charts)
+                        propertySections = summary.sections.map { section in
+                            PropertySection(title: section.title, rows: section.rows.map { PropertyRow(label: $0.label, value: $0.value) })
+                        }
+                        loadedFileURL = url
+                        loadedFileName = url.lastPathComponent
+                        hasLoadedFile = true
+                        fileOpenCoordinator.noteOpened(url)
                     }
+                }
+            } catch {
+                await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
+                    completeLoading { parserError = error.localizedDescription }
                 }
             }
         }
@@ -360,9 +414,14 @@ struct ContentView: View {
             dataSetConfiguration = .empty
         }
 
+        let configuration = dataSetConfiguration
+        let requestID = UUID()
+        summaryRequestID = requestID
+        timeSeriesSourceData = nil
+        rawSummaryData = nil
         Task.detached {
             do {
-                let summary = try WindogParser.parse(fileURL: fileURL)
+                let summary = try WindogParser.parse(fileURL: fileURL, configuration: configuration)
                 let sections = summary.sections.map { section in
                     PropertySection(
                         title: section.title,
@@ -374,13 +433,12 @@ struct ContentView: View {
                 await MainActor.run {
                     completeLoading {
                         let parsedCharts = AppChartData(decoded: summary.charts)
-                        sourcePropertySections = sections
-                        sourceChartData = parsedCharts
+                        guard summaryRequestID == requestID else { return }
+                        rawSummaryData = summary.sourceData
+                        timeSeriesSourceData = summary.analysisData
+                    timeSeriesRevision = UUID()
                         propertySections = sections
                         chartData = parsedCharts
-                        if preserveConfiguration {
-                            applyConfiguration(dataSetConfiguration)
-                        }
                         loadedFileName = summary.fileName
                         fileOpenCoordinator.noteOpened(fileURL)
                         hasLoadedFile = true
@@ -464,10 +522,31 @@ struct ContentView: View {
     }
 
     private func applyConfiguration(_ updated: DataSetConfiguration) {
-        dataSetConfiguration = updated
-        let shear = ShearComputation(columns: updated.columns)
-        chartData = sourceChartData.applying(configuration: updated, shear: shear)
-        propertySections = sourcePropertySections.applying(dataSet: updated.dataSet, shear: shear)
+        guard let rawSummaryData else { return }
+        let requestID = UUID()
+        summaryRequestID = requestID
+        Task.detached {
+            do {
+                let summary = try NativeSummaryAnalysis.build(dataset: rawSummaryData, configuration: updated)
+                await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
+                    dataSetConfiguration = updated
+                    chartData = AppChartData(decoded: summary.charts)
+                    timeSeriesSourceData = summary.analysisData
+                    timeSeriesRevision = UUID()
+                    propertySections = summary.sections.map { section in
+                        PropertySection(title: section.title, rows: section.rows.map {
+                            PropertyRow(label: $0.label, value: $0.value)
+                        })
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    guard summaryRequestID == requestID else { return }
+                    parserError = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func saveWindog() {
@@ -480,7 +559,7 @@ struct ContentView: View {
 
     private func saveWindogAs() {
         guard canSaveAsWindog, let loadedFileURL else {
-            parserError = "Save As is only supported after opening a .windog, .txt, .csv, or .tsv file."
+            parserError = "Save As requires an existing .windog file."
             return
         }
 
@@ -587,17 +666,20 @@ struct ContentView: View {
     }
 
     private var timeSeriesView: some View {
-        TimeSeriesView(data: chartData.timeSeries, fileURL: loadedFileURL)
+        TimeSeriesView(data: chartData.timeSeries, fileURL: loadedFileURL,
+                       sourceData: timeSeriesSourceData, sourceRevision: timeSeriesRevision)
             .background(Color(.windowBackgroundColor))
     }
 
     private var windRoseView: some View {
-        WindRoseView(series: chartData.rose, data: chartData.timeSeries, fileURL: loadedFileURL)
+        WindRoseView(series: chartData.rose, data: chartData.timeSeries, fileURL: loadedFileURL,
+                     sourceData: timeSeriesSourceData, sourceRevision: timeSeriesRevision)
             .background(Color(.windowBackgroundColor))
     }
 
     private var histogramView: some View {
-        HistogramView(data: chartData.timeSeries, fileURL: loadedFileURL)
+        HistogramView(data: chartData.timeSeries, fileURL: loadedFileURL,
+                      sourceData: timeSeriesSourceData, sourceRevision: timeSeriesRevision)
             .background(Color(.windowBackgroundColor))
     }
 
@@ -618,14 +700,14 @@ struct ContentView: View {
     }
 
     private func yTicks(for series: [NamedSeries], fallback: [Double]) -> [Double] {
-        let maxValue = series.flatMap(\.points).map(\.y).max() ?? fallback.last ?? 150
+        let maxValue = series.flatMap(\.points).map(\.y).filter(\.isFinite).max() ?? fallback.last ?? 150
         let step = maxValue > 160 ? 50.0 : 30.0
         let top = ceil(maxValue / step) * step
         return stride(from: 0.0, through: top, by: step).map { $0 }
     }
 
     private func compactTicks(for series: [NamedSeries], fallback: [Double]) -> [Double] {
-        let maxValue = series.flatMap(\.points).map(\.y).max() ?? fallback.last ?? 12
+        let maxValue = series.flatMap(\.points).map(\.y).filter(\.isFinite).max() ?? fallback.last ?? 12
         let top = max(ceil(maxValue / 2) * 2, 2)
         let step = max(top / 4, 1)
         return stride(from: 0.0, through: top, by: step).map { $0 }
@@ -665,221 +747,6 @@ extension AppChartData {
         )
     }
 
-    func applying(configuration: DataSetConfiguration, shear recalculatedShear: ShearComputation? = nil) -> AppChartData {
-        let visibleColumns = configuration.columns.filter(\.visible)
-        let visibleIDs = Set(visibleColumns.map(\.id))
-        let columnByID = Dictionary(uniqueKeysWithValues: visibleColumns.map { ($0.id, $0) })
-
-        func displayName(for id: String) -> String {
-            columnByID[id]?.label ?? id
-        }
-
-        func filterSeries(_ series: [NamedSeries], rename: Bool) -> [NamedSeries] {
-            series.compactMap { item in
-                guard visibleIDs.contains(item.name) else { return nil }
-                return NamedSeries(
-                    name: rename ? displayName(for: item.name) : item.name,
-                    colorName: columnByID[item.name]?.colorName ?? item.colorName,
-                    points: item.points
-                )
-            }
-        }
-
-        return AppChartData(
-            shear: recalculatedShear?.series ?? shear,
-            rose: rose,
-            monthly: filterSeries(monthly, rename: true),
-            diurnal: filterSeries(diurnal, rename: true),
-            timeSeries: timeSeries.applying(configuration: configuration)
-        )
-    }
-}
-
-extension TimeSeriesData {
-    func applying(configuration: DataSetConfiguration) -> TimeSeriesData {
-        let visibleColumns = configuration.columns.filter(\.visible)
-        let columnByID = Dictionary(uniqueKeysWithValues: visibleColumns.map { ($0.id, $0) })
-        let channels = channels.compactMap { channel -> TimeSeriesChannel? in
-            guard let column = columnByID[channel.id] else { return nil }
-            return TimeSeriesChannel(
-                id: channel.id,
-                name: column.label,
-                colorName: column.colorName,
-                defaultVisible: channel.defaultVisible,
-                unit: column.unit,
-                kind: channel.kind
-            )
-        }
-        return TimeSeriesData(
-            series: series.filter { columnByID[$0.name] != nil },
-            channels: channels,
-            monthLabels: monthLabels,
-            startDate: startDate,
-            endDate: endDate,
-            years: years
-        )
-    }
-}
-
-extension Array where Element == PropertySection {
-    func applying(dataSet: DataSetInformation, shear: ShearComputation? = nil) -> [PropertySection] {
-        map { section in
-            if section.title == "Wind shear coefficients", let shear {
-                return PropertySection(
-                    title: section.title,
-                    rows: [
-                        PropertyRow(label: "Power law exponent:", value: formatOptionalNumber(shear.powerLawExponent, digits: 3)),
-                        PropertyRow(label: "Surface roughness:", value: "\(formatRoughness(shear.roughnessLength)) m"),
-                        PropertyRow(label: "Roughness class:", value: formatOptionalNumber(shear.roughnessClass, digits: 2))
-                    ]
-                )
-            }
-            guard section.title == "Data set properties" else { return section }
-            return PropertySection(
-                title: section.title,
-                rows: section.rows.map { row in
-                    switch row.label {
-                    case "Latitude:":
-                        return PropertyRow(label: row.label, value: String(format: "N %.6f", dataSet.latitude))
-                    case "Longitude:":
-                        return PropertyRow(label: row.label, value: String(format: "E %.6f", dataSet.longitude))
-                    case "Elevation:":
-                        return PropertyRow(label: row.label, value: "\(formatDataSetNumber(dataSet.elevation, digits: 0)) m")
-                    case "Calm threshold:":
-                        return PropertyRow(label: row.label, value: "\(formatDataSetNumber(dataSet.calmThreshold, digits: 0)) m/s")
-                    default:
-                        return row
-                    }
-                }
-            )
-        }
-    }
-}
-
-struct ShearComputation {
-    let series: [NamedSeries]
-    let powerLawExponent: Double?
-    let roughnessLength: Double?
-    let roughnessClass: Double?
-
-    init(columns: [DataColumnConfiguration]) {
-        let measured = columns
-            .filter { $0.visible && $0.type == "Wind Speed" && $0.subtype == "Mean" }
-            .compactMap { column -> (height: Double, speed: Double)? in
-                guard let height = column.height, height > 0, let speed = parseStatNumber(column.mean), speed > 0 else {
-                    return nil
-                }
-                return (height, speed)
-            }
-            .sorted { $0.height < $1.height }
-
-        guard measured.count >= 2, let maxHeight = measured.map(\.height).max() else {
-            series = []
-            powerLawExponent = nil
-            roughnessLength = nil
-            roughnessClass = nil
-            return
-        }
-
-        let samples = (0...80).map { 1.0 + (maxHeight - 1.0) * Double($0) / 80.0 }
-        let powerFit = linearFit(measured.map { (log($0.height), log($0.speed)) })
-        let alpha = powerFit?.slope
-        let powerPoints = powerFit.map { fit in
-            samples.map { height in
-                SeriesPoint(x: exp(fit.intercept) * pow(height, fit.slope), y: height)
-            }
-        } ?? []
-
-        let logFit = linearFit(measured.map { (log($0.height), $0.speed) })
-        let roughness = logFit.flatMap { fit -> Double? in
-            guard fit.slope > 0 else { return nil }
-            return exp(-fit.intercept / fit.slope)
-        }
-        let logPoints = logFit.map { fit in
-            samples.map { height in
-                SeriesPoint(x: max(0, fit.intercept + fit.slope * log(height)), y: height)
-            }
-        } ?? []
-
-        series = [
-            NamedSeries(
-                name: "Measured data",
-                colorName: "measured",
-                points: measured.map { SeriesPoint(x: $0.speed, y: $0.height) }
-            ),
-            NamedSeries(name: "Power law fit", colorName: "power", points: powerPoints),
-            NamedSeries(name: "Log law fit", colorName: "log", points: logPoints)
-        ]
-        powerLawExponent = alpha
-        roughnessLength = roughness
-        if let roughness {
-            roughnessClass = roughnessClassValue(roughness)
-        } else {
-            roughnessClass = nil
-        }
-    }
-}
-
-private func parseStatNumber(_ value: String) -> Double? {
-    Double(value.replacingOccurrences(of: ",", with: ""))
-}
-
-private func linearFit(_ points: [(x: Double, y: Double)]) -> (intercept: Double, slope: Double)? {
-    let pairs = points.filter { $0.x.isFinite && $0.y.isFinite && $0.x > 0 && $0.y > 0 }
-    guard pairs.count >= 2 else { return nil }
-    let n = Double(pairs.count)
-    let sx = pairs.reduce(0) { $0 + $1.x }
-    let sy = pairs.reduce(0) { $0 + $1.y }
-    let sxx = pairs.reduce(0) { $0 + $1.x * $1.x }
-    let sxy = pairs.reduce(0) { $0 + $1.x * $1.y }
-    let denominator = n * sxx - sx * sx
-    guard abs(denominator) > 1e-12 else { return nil }
-    let slope = (n * sxy - sx * sy) / denominator
-    let intercept = (sy - slope * sx) / n
-    return (intercept, slope)
-}
-
-private func roughnessClassValue(_ roughnessLength: Double) -> Double? {
-    guard roughnessLength > 0, roughnessLength.isFinite else { return nil }
-    let table: [(Double, Double)] = [
-        (0.0, 0.0002), (0.5, 0.0024), (1.0, 0.03), (1.5, 0.055),
-        (2.0, 0.1), (2.5, 0.2), (3.0, 0.4), (3.5, 0.8), (4.0, 1.6)
-    ]
-    if roughnessLength <= table[0].1 { return table[0].0 }
-    if roughnessLength >= table[table.count - 1].1 { return table[table.count - 1].0 }
-    let logZ = log(roughnessLength)
-    for index in 0..<(table.count - 1) {
-        let a = table[index]
-        let b = table[index + 1]
-        if a.1 <= roughnessLength && roughnessLength <= b.1 {
-            let fraction = (logZ - log(a.1)) / (log(b.1) - log(a.1))
-            return a.0 + (b.0 - a.0) * fraction
-        }
-    }
-    return nil
-}
-
-private func formatOptionalNumber(_ value: Double?, digits: Int) -> String {
-    guard let value, value.isFinite else { return "-" }
-    return String(format: "%.\(digits)f", value)
-}
-
-private func formatRoughness(_ value: Double?) -> String {
-    guard let value, value.isFinite else { return "-" }
-    if value < 0.0001 {
-        return String(format: "%.6f", value)
-    }
-    if value < 0.01 {
-        return String(format: "%.5f", value)
-    }
-    return String(format: "%.4f", value)
-}
-
-private func formatDataSetNumber(_ value: Double, digits: Int) -> String {
-    if abs(value.rounded() - value) < 0.001 {
-        return String(Int(value.rounded()))
-    }
-    return String(format: "%.\(digits)f", value)
 }
 
 extension DataSetConfiguration {
@@ -979,6 +846,7 @@ extension TimeSeriesData {
         }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
         return formatter.date(from: value) ?? Date(timeIntervalSince1970: 0)
     }
@@ -1116,6 +984,7 @@ struct SummarySidebar: View {
     let isLoading: Bool
 
     var body: some View {
+        ScrollView {
         VStack(alignment: .leading, spacing: 0) {
             VStack(alignment: .leading, spacing: 5) {
                 Text(fileName)
@@ -1144,6 +1013,7 @@ struct SummarySidebar: View {
         }
         .padding(.horizontal, 10)
         .padding(.top, 12)
+        }
         .background(Color(.windowBackgroundColor))
     }
 }

@@ -7,6 +7,7 @@ final class WindLabFileOpenCoordinator: ObservableObject {
     @Published private(set) var openPanelRequestID = 0
     @Published private(set) var saveRequestID = 0
     @Published private(set) var saveAsRequestID = 0
+    @Published private(set) var exportRequestID = 0
     @Published var requestedURL: URL?
     @Published private(set) var recentFiles: [URL]
 
@@ -27,6 +28,10 @@ final class WindLabFileOpenCoordinator: ObservableObject {
 
     func requestSaveAs() {
         saveAsRequestID += 1
+    }
+
+    func requestExport() {
+        exportRequestID += 1
     }
 
     func open(_ url: URL) {
@@ -89,6 +94,11 @@ struct WindLabMacApp: App {
                     fileOpenCoordinator.requestSaveAs()
                 }
                 .keyboardShortcut("s", modifiers: [.command, .shift])
+
+                Button("Export Data…") {
+                    fileOpenCoordinator.requestExport()
+                }
+                .keyboardShortcut("e", modifiers: [.command, .shift])
 
                 Menu("Open Recent") {
                     if fileOpenCoordinator.recentFiles.isEmpty {

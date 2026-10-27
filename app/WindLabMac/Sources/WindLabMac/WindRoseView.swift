@@ -1,776 +1,341 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+import WindogCore
+
+private struct RoseOptions: Hashable {
+    var display = RoseDisplay.occurrences
+    var grouping = RoseGrouping.allDirections
+    var sectors = 16
+    var direction = ""
+    var dataIDs: Set<String> = []
+    var speed = ""
+    var binColumn = ""
+    var customWidth = false
+    var customStart = false
+    var halfFirst = false
+    var width = "1"
+    var start = "0"
+    var dateFilter = false
+    var year = "-"
+    var month = "-"
+    var rangeFilter = false
+    var from = Date(timeIntervalSince1970: 0)
+    var to = Date(timeIntervalSince1970: 0)
+    var columnFilter = false
+    var filterColumn = "-"
+    var minimumEnabled = true
+    var maximumEnabled = true
+    var minimum = "0"
+    var maximum = "50"
+    var flagFilter = true
+    var unflagged = true
+    var flagIDs: Set<UInt16> = []
+}
 
 struct WindRoseView: View {
     let series: [NamedPolarSeries]
     let data: TimeSeriesData
     let fileURL: URL?
+    var sourceData: WindExportDataSet? = nil
+    var sourceRevision: UUID? = nil
+    @State private var options = RoseOptions()
+    @State private var result: RoseResult?
+    @State private var visibleIDs: Set<String> = []
+    @State private var table = false
+    @State private var style = RosePlotStyle.line
+    @State private var northOffset = 0.0
+    @State private var showsGrid = true
+    @State private var busy = false
+    @State private var error: String?
 
-    @State private var display = "occurrences"
-    @State private var versus = "all direction sensors"
-    @State private var sectors = 16
-    @State private var format = "chart"
-    @State private var directionID = ""
-    @State private var selectedDataColumns: Set<String> = []
-    @State private var selectedSeries: Set<String> = []
-    @State private var roseSeries: [NamedPolarSeries] = []
-    @State private var isLoading = false
-    @State private var loadError: String?
-    @State private var filterMode = "none"
-    @State private var selectedYear = "-"
-    @State private var selectedMonth = "-"
-    @State private var rangeStart = ""
-    @State private var rangeEnd = ""
-    @State private var filterColumn = "-"
-    @State private var filterMin = "0"
-    @State private var filterMax = "50"
-
-    private let displayOptions = ["occurrences", "frequency", "mean", "min", "max", "std. dev.", "total energy", "scatter plot"]
-    private let normalVersusOptions = ["all direction sensors", "direction", "direction and month", "direction and hour", "direction and bin"]
-    private let energyVersusOptions = ["direction", "direction and month"]
-    private let sectorOptions = [4, 8, 12, 16, 18, 24, 36, 48, 72, 120, 180, 360]
-    private let months = [("-", "<All>"), ("1", "Jan"), ("2", "Feb"), ("3", "Mar"), ("4", "Apr"), ("5", "May"), ("6", "Jun"), ("7", "Jul"), ("8", "Aug"), ("9", "Sep"), ("10", "Oct"), ("11", "Nov"), ("12", "Dec")]
+    private var loadKey: String { "\(options)|\(sourceRevision?.uuidString ?? "")|\(fileURL?.path ?? "")" }
+    private var directionColumns: [TimeSeriesChannel] {
+        data.channels.filter { channel in
+            guard channel.kind == "wind_direction" else { return false }
+            return sourceData?.columns.first { $0.id == channel.id }?.subtype == "Mean" || WindColumnMetadata.subtype(in: channel.name) == "Mean"
+        }
+    }
+    private var speedColumns: [TimeSeriesChannel] {
+        data.channels.filter { $0.kind == "wind_speed" && $0.unit == "m/s" && WindColumnMetadata.subtype(in: $0.name) == "Mean" }
+    }
+    private var flagsAvailable: Bool {
+        sourceData?.flags != nil && sourceData?.columns.allSatisfy { $0.flagIntervals != nil } == true
+    }
+    private var groupings: [RoseGrouping] {
+        options.display == .totalEnergy ? [.direction, .month] : options.display == .occurrences || options.display == .frequency
+            ? RoseGrouping.allCases : [.direction, .month, .hour, .bin]
+    }
+    private var title: String { Self.label(options.display) + " vs. " + Self.label(options.grouping) }
 
     var body: some View {
         HStack(spacing: 0) {
-            controls
-                .frame(width: 360)
-
+            ScrollView { controls.padding(12) }.frame(width: 360)
             Divider()
-
-            HStack(alignment: .top, spacing: 0) {
-                PlotPanel(title: chartTitle) {
-                    if visibleRoseSeries.isEmpty {
-                        EmptyRosePlaceholder()
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(title).font(.headline)
+                    Spacer()
+                    if busy { ProgressView().controlSize(.small) }
+                    Button("Copy table") { copyTable() }.disabled(result == nil)
+                    Button("Export CSV…") { saveCSV() }.disabled(result == nil)
+                    Button("Save graph…") { saveGraph() }.disabled(result == nil)
+                }
+                if let error { Text(error).foregroundStyle(.red).textSelection(.enabled) }
+                if let result {
+                    if table {
+                        WindRoseResultTable(result: result, display: options.display)
                     } else {
-                        WindRoseChart(series: visibleRoseSeries, showsLegend: false)
+                        HStack(alignment: .top) {
+                            WindRoseVisualization(result: result, display: options.display, visibleIDs: visibleIDs,
+                                style: style, northOffset: northOffset, showsGrid: showsGrid).background(.white)
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 7) {
+                                    ForEach(Array(result.series.enumerated()), id: \.element.id) { index, item in
+                                        Toggle(item.label, isOn: Binding(get: { visibleIDs.contains(item.id) }, set: {
+                                            if $0 { visibleIDs.insert(item.id) } else { visibleIDs.remove(item.id) }
+                                        })).help(item.label).foregroundStyle(WindRoseVisualization.seriesColor(item, index: index))
+                                    }
+                                }.toggleStyle(.checkbox)
+                            }.frame(width: 190)
+                        }
                     }
+                    Text("Valid source rows: \(result.overallValidCount.formatted()) · Calm rows: \(result.calmCount.formatted())")
+                        .font(.caption).foregroundStyle(.secondary)
+                    ForEach(result.notes, id: \.self) { Text($0).font(.caption).foregroundStyle(.secondary) }
+                } else {
+                    ContentUnavailableView("No wind rose", systemImage: "wind", description: Text(error ?? "Choose a direction column."))
                 }
-                .padding(.vertical, 6)
-                .padding(.leading, 8)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                roseLegend
-                    .frame(width: 170)
-                    .padding(.top, 12)
-                    .padding(.horizontal, 8)
+            }.padding(12)
+        }
+        .background(Color(.windowBackgroundColor))
+        .font(.system(size: 12))
+        .environment(\.timeZone, TimeZone(secondsFromGMT: 0)!)
+        .onAppear { reset() }
+        .onChange(of: data.channels) { _, _ in reset() }
+        .onChange(of: fileURL) { _, _ in reset() }
+        .onChange(of: options.display) { _, _ in
+            if !groupings.contains(options.grouping) { options.grouping = .direction }
+            if options.display == .totalEnergy { options.dataIDs = options.dataIDs.intersection(Set(speedColumns.map(\.id))) }
+            if options.dataIDs.isEmpty, let id = speedColumns.first?.id { options.dataIDs = [id] }
+            if [.mean, .minimum, .maximum, .standardDeviation, .scatter].contains(options.display),
+               let unit = data.channels.first(where: { options.dataIDs.contains($0.id) })?.unit {
+                options.dataIDs = options.dataIDs.intersection(Set(data.channels.filter { $0.unit == unit }.map(\.id)))
             }
-            .overlay(alignment: .topLeading) {
-                if isLoading {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(10)
-                }
-            }
-            .background(Color(.windowBackgroundColor))
         }
-        .onAppear {
-            resetDefaults()
-            loadWindRose()
-        }
-        .onChange(of: data.channels) { _, _ in
-            resetDefaults()
-            loadWindRose()
-        }
-        .onChange(of: display) { _, _ in normalizeForDisplay(); loadWindRose() }
-        .onChange(of: versus) { _, _ in loadWindRose() }
-        .onChange(of: sectors) { _, _ in loadWindRose() }
-        .onChange(of: directionID) { _, _ in loadWindRose() }
-        .onChange(of: selectedDataColumns) { _, _ in loadWindRose() }
-        .onChange(of: filterMode) { _, _ in loadWindRose() }
-        .onChange(of: selectedYear) { _, _ in loadWindRose() }
-        .onChange(of: selectedMonth) { _, _ in loadWindRose() }
-        .onChange(of: rangeStart) { _, _ in loadWindRose() }
-        .onChange(of: rangeEnd) { _, _ in loadWindRose() }
-        .onChange(of: filterColumn) { _, _ in loadWindRose() }
-        .onChange(of: filterMin) { _, _ in loadWindRose() }
-        .onChange(of: filterMax) { _, _ in loadWindRose() }
+        .task(id: loadKey) { await calculate() }
     }
 
     private var controls: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 8) {
-                Text("Display")
-                    .frame(width: 92, alignment: .leading)
-                CompactPicker(selection: $display, options: displayOptions)
-                    .frame(width: 190)
+        VStack(alignment: .leading, spacing: 12) {
+            Picker("Display", selection: $options.display) { ForEach(RoseDisplay.allCases, id: \.self) { Text(Self.label($0)).tag($0) } }
+            Picker("versus", selection: $options.grouping) { ForEach(groupings, id: \.self) { Text(Self.label($0)).tag($0) } }
+            HStack {
+                Picker("Sectors", selection: $options.sectors) {
+                    ForEach([4,8,12,16,18,24,36,48,72,120,180,360], id: \.self) { Text(String($0)).tag($0) }
+                }
+                Picker("Format", selection: $table) { Text("Chart").tag(false); Text("Table").tag(true) }.pickerStyle(.segmented)
             }
-            .padding(.top, 10)
-
-            HStack(spacing: 8) {
-                Text("versus")
-                    .frame(width: 92, alignment: .leading)
-                CompactPicker(selection: $versus, options: versusOptions)
-                    .frame(width: 190)
+            DisclosureGroup("Style") {
+                Picker("Plot", selection: $style) {
+                    Text("Line").tag(RosePlotStyle.line); Text("Filled").tag(RosePlotStyle.filled); Text("Bars").tag(RosePlotStyle.bars)
+                }.disabled(options.display == .scatter)
+                Toggle("Show radial grid", isOn: $showsGrid)
+                HStack { Text("Rotate view"); Slider(value: $northOffset, in: 0...360); Text("\(Int(northOffset))°") }
             }
-
-            HStack(spacing: 10) {
-                Text("Sectors")
-                    .frame(width: 92, alignment: .leading)
-                CompactNumberPicker(selection: $sectors, options: sectorOptions)
-                    .frame(width: 64)
-                Text("Format")
-                    .padding(.leading, 8)
-                FormatButton(systemName: "chart.bar.xaxis", isSelected: format == "chart") { format = "chart" }
-                FormatButton(systemName: "tablecells", isSelected: format == "table") { format = "table" }
+            Divider()
+            Picker("Direction sensor", selection: $options.direction) {
+                ForEach(directionColumns) { Text($0.name).tag($0.id) }
+            }.disabled(options.grouping == .allDirections)
+            if options.grouping != .allDirections {
+                HStack { Text("Data columns"); Spacer(); Button("Clear All") { options.dataIDs.removeAll() } }
+                ScrollView {
+                    VStack(alignment: .leading) {
+                        ForEach(options.display == .totalEnergy ? speedColumns : data.channels) { channel in
+                            Toggle(channel.name, isOn: Binding(get: { options.dataIDs.contains(channel.id) }, set: {
+                                if $0 { options.dataIDs.insert(channel.id) } else { options.dataIDs.remove(channel.id) }
+                            })).help(channel.name).disabled(!allowsUnit(channel))
+                        }
+                    }.toggleStyle(.checkbox)
+                }.frame(height: 115)
             }
-
-            HStack(spacing: 10) {
-                Text("Style")
-                    .foregroundStyle(.secondary)
-                    .frame(width: 92, alignment: .leading)
-                DisabledToolButton(systemName: "gearshape")
-                DisabledToolButton(systemName: "globe")
+            Picker("Speed sensor", selection: $options.speed) {
+                Text("<Automatic association>").tag("")
+                ForEach(speedColumns) { Text($0.name).tag($0.id) }
             }
-
-            modeSpecificControls
-
-            BinSettingsView()
-
-            Spacer(minLength: 14)
-
-            FilterPanel(
-                directionName: currentDirectionName,
-                years: data.years,
-                selectedYear: $selectedYear,
-                selectedMonth: $selectedMonth,
-                rangeStart: $rangeStart,
-                rangeEnd: $rangeEnd,
-                filterMode: $filterMode,
-                filterColumn: $filterColumn,
-                filterMin: $filterMin,
-                filterMax: $filterMax,
-                channels: data.channels,
-                minDate: data.startDate,
-                maxDate: data.endDate
-            )
-            .frame(height: 246)
-            .padding(.bottom, 14)
-        }
-        .font(.system(size: 13))
-        .padding(.horizontal, 12)
-        .background(Color(.windowBackgroundColor))
+            if options.grouping == .bin {
+                Picker("Bin column", selection: $options.binColumn) { ForEach(data.channels) { Text($0.name).tag($0.id) } }
+                HistogramBinControls(unit: data.channels.first { $0.id == options.binColumn }?.unit ?? "",
+                    customWidth: $options.customWidth, customStart: $options.customStart, halfFirst: $options.halfFirst,
+                    width: $options.width, start: $options.start)
+            }
+            Divider()
+            Text("Filter by").fontWeight(.medium)
+            if flagsAvailable, let flags = sourceData?.flags {
+                Toggle("Flag", isOn: $options.flagFilter)
+                VStack(alignment: .leading) {
+                    Toggle("<Unflagged data>", isOn: $options.unflagged)
+                    ForEach(flags, id: \.id) { flag in
+                        Toggle(flag.name, isOn: Binding(get: { options.flagIDs.contains(flag.id) }, set: {
+                            if $0 { options.flagIDs.insert(flag.id) } else { options.flagIDs.remove(flag.id) }
+                        }))
+                    }
+                }.padding(.leading, 12).disabled(!options.flagFilter)
+            } else { Text("Flag intervals unavailable; stored values are used.").font(.caption).foregroundStyle(.secondary) }
+            Toggle("Date", isOn: $options.dateFilter)
+            HStack {
+                Picker("Year", selection: $options.year) {
+                    Text("<All>").tag("-"); ForEach(data.years, id: \.self) { Text(String($0)).tag(String($0)) }
+                }
+                Picker("Month", selection: $options.month) {
+                    Text("<All>").tag("-"); ForEach(1...12, id: \.self) { Text(String($0)).tag(String($0)) }
+                }.disabled(options.grouping == .month)
+            }.disabled(!options.dateFilter)
+            Toggle("Date range", isOn: $options.rangeFilter)
+            HStack {
+                DatePicker("From", selection: $options.from, displayedComponents: .date).labelsHidden()
+                Text("to"); DatePicker("To", selection: $options.to, displayedComponents: .date).labelsHidden()
+            }.disabled(!options.rangeFilter)
+            Toggle("Data column", isOn: $options.columnFilter)
+            Picker("", selection: $options.filterColumn) {
+                Text("<All>").tag("-"); ForEach(data.channels) { Text($0.name).tag($0.id) }
+            }.labelsHidden().disabled(!options.columnFilter)
+            HStack {
+                Toggle("Min", isOn: $options.minimumEnabled)
+                TextField("", text: $options.minimum).frame(width: 55).disabled(!options.minimumEnabled)
+                Toggle("Max", isOn: $options.maximumEnabled)
+                TextField("", text: $options.maximum).frame(width: 55).disabled(!options.maximumEnabled)
+            }.disabled(!options.columnFilter).textFieldStyle(.roundedBorder)
+        }.toggleStyle(.checkbox)
     }
 
-    @ViewBuilder
-    private var modeSpecificControls: some View {
-        if versus == "direction" || display == "total energy" {
-            VStack(alignment: .leading, spacing: 8) {
-                PickerField(label: "Direction sensor", selection: $directionID, options: directionChannels.map(\.id))
-                HStack(alignment: .top, spacing: 8) {
-                    Text("Data column")
-                        .frame(width: 92, alignment: .leading)
-                    Button("Clear All") {
-                        selectedDataColumns.removeAll()
-                    }
-                    .controlSize(.small)
-                    DataColumnChecklist(
-                        channels: windRoseDataChannels,
-                        selectedIDs: $selectedDataColumns,
-                        enabledUnit: display == "total energy" ? "m/s" : nil
-                    )
-                    .frame(height: 190)
+    private func allowsUnit(_ channel: TimeSeriesChannel) -> Bool {
+        guard [.mean, .minimum, .maximum, .standardDeviation, .scatter].contains(options.display), !options.dataIDs.contains(channel.id) else { return true }
+        let units = Set(data.channels.filter { options.dataIDs.contains($0.id) }.map(\.unit))
+        return units.isEmpty || units.contains(channel.unit)
+    }
+
+    private func reset() {
+        options.direction = directionColumns.first?.id ?? ""
+        options.dataIDs = Set(speedColumns.first.map { [$0.id] } ?? [])
+        options.binColumn = speedColumns.first?.id ?? data.channels.first?.id ?? ""
+        options.from = data.startDate; options.to = data.endDate.addingTimeInterval(-1)
+        options.flagIDs = Set(sourceData?.flags?.filter { $0.name.localizedCaseInsensitiveContains("synth") || $0.name.contains("合成") }.map(\.id) ?? [])
+    }
+
+    private func calculate() async {
+        guard !options.direction.isEmpty else { return }
+        let options = options; let dataset = sourceData; let url = fileURL; let canFilterFlags = flagsAvailable
+        busy = true; error = nil
+        do {
+            let next = try await Task.detached {
+                let source: WindExportDataSet
+                if let dataset { source = dataset }
+                else if let url { source = try WindogParser.exportDataSet(fileURL: url) }
+                else { throw WindogError.invalid("No file") }
+                let filtered = NativeFlagFiltering.applying(to: source, enabled: options.flagFilter && canFilterFlags,
+                                                           includeUnflagged: options.unflagged, flagIDs: options.flagIDs)
+                func number(_ text: String) throws -> Double {
+                    guard let value = Double(text), value.isFinite else { throw WindogError.invalid("Invalid numeric setting: \(text)") }
+                    return value
+                }
+                var selection = HistogramSelection()
+                if options.dateFilter { selection.year = Int(options.year); selection.month = Int(options.month) }
+                if options.rangeFilter { selection.startDate = Self.day(options.from); selection.endDate = Self.day(options.to).addingTimeInterval(86400) }
+                if options.columnFilter, options.filterColumn != "-" {
+                    selection.columnID = options.filterColumn
+                    selection.minimum = options.minimumEnabled ? try number(options.minimum) : nil
+                    selection.maximum = options.maximumEnabled ? try number(options.maximum) : nil
+                }
+                let ids = source.columns.filter { options.dataIDs.contains($0.id) }.map(\.id)
+                let request = RoseRequest(directionID: options.direction, dataIDs: ids,
+                    grouping: options.grouping, display: options.display, sectors: options.sectors,
+                    binID: options.binColumn.isEmpty ? nil : options.binColumn, speedID: options.speed.isEmpty ? nil : options.speed,
+                    bins: HistogramBinSettings(width: options.customWidth ? try number(options.width) : nil,
+                                               start: options.customStart ? try number(options.start) : nil, halfFirst: options.halfFirst),
+                    selection: selection)
+                return try WindRoseAnalysis.analyze(filtered, request: request)
+            }.value
+            guard !Task.isCancelled else { return }
+            let old = Set(result?.series.map(\.id) ?? [])
+            let available = Set(next.series.map(\.id))
+            visibleIDs = old == available ? visibleIDs : available
+            result = next; busy = false
+        } catch {
+            guard !Task.isCancelled else { return }
+            result = nil; self.error = error.localizedDescription; busy = false
+        }
+    }
+
+    nonisolated private static func day(_ value: Date) -> Date {
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar.startOfDay(for: value)
+    }
+    nonisolated private static func label(_ value: RoseDisplay) -> String {
+        switch value {
+        case .standardDeviation: "Standard deviation"
+        case .totalEnergy: "Total energy share"
+        case .scatter: "Scatter plot"
+        default: value.rawValue.capitalized
+        }
+    }
+    nonisolated private static func label(_ value: RoseGrouping) -> String {
+        switch value {
+        case .allDirections: "All direction sensors"
+        case .direction: "Direction"
+        case .month: "Direction and month"
+        case .hour: "Direction and two-hour period"
+        case .bin: "Direction and bin"
+        }
+    }
+    private func copyTable() {
+        guard let result else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(NativeRoseTable.text(result, display: options.display), forType: .string)
+    }
+    private func saveCSV() {
+        guard let result else { return }
+        let text = "\u{FEFF}" + NativeRoseTable.text(result, display: options.display, delimiter: ",")
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.commaSeparatedText]; panel.nameFieldStringValue = "wind-rose.csv"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do { try text.write(to: url, atomically: true, encoding: .utf8) } catch { self.error = error.localizedDescription }
+        }
+    }
+    @MainActor private func saveGraph() {
+        guard let result else { return }
+        let panel = NSSavePanel(); panel.allowedContentTypes = [.png]; panel.nameFieldStringValue = "wind-rose.png"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            let renderer = ImageRenderer(content: WindRoseVisualization(result: result, display: options.display, visibleIDs: visibleIDs,
+                style: style, northOffset: northOffset, showsGrid: showsGrid).frame(width: 1000, height: 1000).background(.white))
+            renderer.scale = 2
+            guard let image = renderer.nsImage, let tiff = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff), let png = bitmap.representation(using: .png, properties: [:]) else { return }
+            do { try png.write(to: url, options: .atomic) } catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
+enum NativeRoseTable {
+    static func text(_ result: RoseResult, display: RoseDisplay, delimiter: String = "\t") -> String {
+        func quote(_ value: String) -> String { "\"" + value.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
+        var rows: [[String]] = []
+        if display == .scatter {
+            rows.append(["Data column", "Direction (deg)", "Value", "Unit"])
+            for series in result.series {
+                for point in series.scatterPoints {
+                    rows.append([series.label, HistogramPresentation.number(point.direction), HistogramPresentation.number(point.value), series.unit])
                 }
             }
         } else {
-            VStack(spacing: 7) {
-                DisabledField(label: "Direction sensor", value: currentDirectionName)
-                DisabledField(label: "Data column", value: currentDirectionName)
-                DisabledField(label: "Bin column", value: currentDirectionName)
-                DisabledField(label: "Speed sensor", value: firstSpeedName)
+            rows.append(["Sector center (deg)"] + result.series.map { $0.label + " [" + $0.unit + "]" })
+            for index in result.sectorCenters.indices {
+                rows.append([HistogramPresentation.number(result.sectorCenters[index])] + result.series.map {
+                    $0.sectorValues[index].map { HistogramPresentation.number($0) } ?? "n/a"
+                })
             }
         }
-    }
-
-    private var roseLegend: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            ForEach(roseSeries) { item in
-                HStack(spacing: 5) {
-                    Rectangle()
-                        .fill(Color.chartColor(item.colorName))
-                        .frame(width: 18, height: 3)
-                    CheckBox(isOn: binding(for: item.name))
-                    Text(item.name)
-                        .font(.system(size: 11))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Spacer(minLength: 0)
-                }
-                .frame(height: 17)
-            }
-            if let loadError {
-                Text(loadError)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.red)
-                    .lineLimit(3)
-            }
-            Spacer(minLength: 0)
-        }
-        .background(Color(.windowBackgroundColor))
-    }
-
-    private var visibleRoseSeries: [NamedPolarSeries] {
-        roseSeries.filter { selectedSeries.contains($0.name) }
-    }
-
-    private var directionChannels: [TimeSeriesChannel] {
-        data.channels.filter { isAverageWindDirectionChannel($0) }
-    }
-
-    private var speedChannels: [TimeSeriesChannel] {
-        data.channels.filter { isAverageWindSpeedChannel($0) }
-    }
-
-    private var windRoseDataChannels: [TimeSeriesChannel] {
-        data.channels.filter { isAverageWindSpeedChannel($0) }
-    }
-
-    private var versusOptions: [String] {
-        display == "total energy" ? energyVersusOptions : normalVersusOptions
-    }
-
-    private var chartTitle: String {
-        if display == "total energy" {
-            return "Proportion of Total Wind Energy vs. \(currentDirectionName)"
-        }
-        return display == "frequency" ? "Wind Direction Frequency" : "Wind Direction Occurrences"
-    }
-
-    private var currentDirectionName: String {
-        directionChannels.first { $0.id == directionID }?.name ?? directionChannels.first?.name ?? ""
-    }
-
-    private var firstSpeedName: String {
-        speedChannels.first?.name ?? ""
-    }
-
-    private func binding(for id: String) -> Binding<Bool> {
-        Binding {
-            selectedSeries.contains(id)
-        } set: { newValue in
-            if newValue {
-                selectedSeries.insert(id)
-            } else {
-                selectedSeries.remove(id)
-            }
-        }
-    }
-
-    private func resetDefaults() {
-        if directionID.isEmpty || !directionChannels.contains(where: { $0.id == directionID }) {
-            directionID = directionChannels.first?.id ?? ""
-        }
-        let availableSpeedIDs = Set(speedChannels.map(\.id))
-        let validSelection = selectedDataColumns.intersection(availableSpeedIDs)
-        if validSelection.isEmpty {
-            selectedDataColumns = availableSpeedIDs
-        } else if validSelection != selectedDataColumns {
-            selectedDataColumns = validSelection
-        }
-        if selectedYear == "-", let firstYear = data.years.first {
-            selectedYear = String(firstYear)
-        }
-        if rangeStart.isEmpty {
-            rangeStart = Self.formatDate(data.startDate)
-        }
-        if rangeEnd.isEmpty {
-            rangeEnd = Self.formatDate(data.endDate)
-        }
-    }
-
-    private func normalizeForDisplay() {
-        if display == "total energy", !energyVersusOptions.contains(versus) {
-            versus = "direction"
-        }
-    }
-
-    private func loadWindRose() {
-        guard let fileURL else {
-            roseSeries = series
-            selectedSeries = Set(series.map(\.name))
-            return
-        }
-        normalizeForDisplay()
-        let displayValue = display
-        let versusValue = versus
-        let sectorsValue = sectors
-        let directionValue = directionID.isEmpty ? "-" : directionID
-        let dataIDs = selectedDataColumns.sorted()
-        let filterValue = filterMode
-        let yearValue = selectedYear
-        let monthValue = selectedMonth
-        let rangeStartValue = clampedDateString(rangeStart)
-        let rangeEndValue = clampedDateString(rangeEnd)
-        let filterColumnValue = filterValue == "column" ? filterColumn : "-"
-        let filterMinValue = filterValue == "column" ? filterMin : "-"
-        let filterMaxValue = filterValue == "column" ? filterMax : "-"
-        isLoading = true
-        loadError = nil
-
-        Task.detached {
-            do {
-                let decoded = try WindogParser.parseWindRose(
-                    fileURL: fileURL,
-                    display: displayValue,
-                    versus: versusValue,
-                    sectors: sectorsValue,
-                    directionID: directionValue,
-                    dataIDs: dataIDs,
-                    filterMode: filterValue,
-                    year: yearValue,
-                    month: monthValue,
-                    rangeStart: rangeStartValue,
-                    rangeEnd: rangeEndValue,
-                    filterColumn: filterColumnValue,
-                    filterMin: filterMinValue,
-                    filterMax: filterMaxValue
-                )
-                let parsedSeries = decoded.series.map(NamedPolarSeries.init(decoded:))
-                await MainActor.run {
-                    roseSeries = parsedSeries
-                    selectedSeries = Set(parsedSeries.map(\.name))
-                    isLoading = false
-                }
-            } catch {
-                await MainActor.run {
-                    loadError = error.localizedDescription
-                    isLoading = false
-                }
-            }
-        }
-    }
-
-    private func clampedDateString(_ value: String) -> String {
-        guard let date = Self.parseDate(value) else { return "-" }
-        return Self.formatDate(min(max(date, data.startDate), data.endDate))
-    }
-
-    private static func parseDate(_ value: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: value)
-    }
-
-    private static func formatDate(_ value: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: value)
-    }
-
-    private func isAverageWindSpeedChannel(_ channel: TimeSeriesChannel) -> Bool {
-        guard channel.unit == "m/s" else { return false }
-        return !isStatisticalChannel(channel)
-    }
-
-    private func isAverageWindDirectionChannel(_ channel: TimeSeriesChannel) -> Bool {
-        channel.kind == "wind_direction" && !isStatisticalChannel(channel)
-    }
-
-    private func isStatisticalChannel(_ channel: TimeSeriesChannel) -> Bool {
-        let name = channel.name.lowercased()
-        let excludedTokens = ["_sd", "_std", "_max", "_min", "_gust", " sd", " std", " max", " min", " gust", "std. dev", "standard deviation"]
-        if excludedTokens.contains(where: name.contains) {
-            return true
-        }
-        let chineseExcludedTokens = ["标准差", "最大", "最小", "极大", "极小", "阵风"]
-        return chineseExcludedTokens.contains(where: channel.name.contains)
-    }
-}
-
-private struct CompactPicker: View {
-    @Binding var selection: String
-    let options: [String]
-
-    var body: some View {
-        Picker("", selection: $selection) {
-            ForEach(options, id: \.self) { option in
-                Text(option).tag(option)
-            }
-        }
-        .labelsHidden()
-        .pickerStyle(.menu)
-        .controlSize(.small)
-    }
-}
-
-private struct CompactNumberPicker: View {
-    @Binding var selection: Int
-    let options: [Int]
-
-    var body: some View {
-        Picker("", selection: $selection) {
-            ForEach(options, id: \.self) { option in
-                Text("\(option)").tag(option)
-            }
-        }
-        .labelsHidden()
-        .pickerStyle(.menu)
-        .controlSize(.small)
-    }
-}
-
-private struct PickerField: View {
-    let label: String
-    @Binding var selection: String
-    let options: [String]
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(label)
-                .frame(width: 92, alignment: .leading)
-            Picker("", selection: $selection) {
-                ForEach(options, id: \.self) { option in
-                    Text(option).tag(option)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .controlSize(.small)
-        }
-    }
-}
-
-private struct DataColumnChecklist: View {
-    let channels: [TimeSeriesChannel]
-    @Binding var selectedIDs: Set<String>
-    let enabledUnit: String?
-
-    var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(channels) { channel in
-                    let enabled = enabledUnit == nil || channel.unit == enabledUnit
-                    HStack(spacing: 5) {
-                        CheckBox(isOn: binding(for: channel.id, enabled: enabled))
-                            .opacity(enabled ? 1 : 0.45)
-                        Text(channel.name)
-                            .font(.system(size: 11))
-                            .foregroundStyle(enabled ? .primary : .secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        Spacer(minLength: 0)
-                    }
-                    .frame(height: 18)
-                }
-            }
-            .padding(5)
-        }
-        .background(Color(.controlBackgroundColor).opacity(0.6))
-        .overlay(Rectangle().stroke(Color(.separatorColor)))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-
-    private func binding(for id: String, enabled: Bool) -> Binding<Bool> {
-        Binding {
-            enabled && selectedIDs.contains(id)
-        } set: { newValue in
-            guard enabled else { return }
-            if newValue {
-                selectedIDs.insert(id)
-            } else {
-                selectedIDs.remove(id)
-            }
-        }
-    }
-}
-
-private struct FormatButton: View {
-    let systemName: String
-    let isSelected: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: systemName)
-                .font(.system(size: 13))
-                .frame(width: 24, height: 22)
-                .background(isSelected ? Color(.selectedControlColor).opacity(0.22) : Color(.controlBackgroundColor))
-                .overlay(Rectangle().stroke(Color(.separatorColor)))
-        }
-        .buttonStyle(.plain)
-    }
-}
-
-private struct DisabledToolButton: View {
-    let systemName: String
-
-    var body: some View {
-        Image(systemName: systemName)
-            .font(.system(size: 12))
-            .foregroundStyle(.secondary.opacity(0.6))
-            .frame(width: 24, height: 22)
-            .background(Color(.controlBackgroundColor).opacity(0.6))
-            .overlay(Rectangle().stroke(Color(.separatorColor).opacity(0.7)))
-    }
-}
-
-private struct DisabledField: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Text(label)
-                .foregroundStyle(.secondary)
-                .frame(width: 98, alignment: .leading)
-            HStack {
-                Text(value)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9))
-                    .foregroundStyle(.secondary)
-            }
-            .padding(.horizontal, 5)
-            .frame(height: 22)
-            .background(Color(.controlBackgroundColor).opacity(0.55))
-            .overlay(Rectangle().stroke(Color(.separatorColor)))
-        }
-    }
-}
-
-private struct BinSettingsView: View {
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            DividerWithTitle("Bin settings")
-            HStack(spacing: 8) {
-                CheckBox(isOn: .constant(false))
-                Text("Width").foregroundStyle(.secondary)
-                DisabledInput(value: "10")
-                Text("deg").foregroundStyle(.secondary).frame(width: 28, alignment: .leading)
-                CheckBox(isOn: .constant(false))
-                Text("Make first bin\nhalf this width")
-                    .foregroundStyle(.secondary)
-                    .font(.system(size: 11))
-                    .lineLimit(2)
-            }
-            HStack(spacing: 8) {
-                CheckBox(isOn: .constant(false))
-                Text("Start at").foregroundStyle(.secondary)
-                DisabledInput(value: "0")
-                Text("deg").foregroundStyle(.secondary)
-            }
-        }
-        .padding(8)
-        .background(Color(.controlBackgroundColor).opacity(0.45))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-private struct FilterPanel: View {
-    let directionName: String
-    let years: [Int]
-    @Binding var selectedYear: String
-    @Binding var selectedMonth: String
-    @Binding var rangeStart: String
-    @Binding var rangeEnd: String
-    @Binding var filterMode: String
-    @Binding var filterColumn: String
-    @Binding var filterMin: String
-    @Binding var filterMax: String
-    let channels: [TimeSeriesChannel]
-    let minDate: Date
-    let maxDate: Date
-
-    private let months = [("-", "<All>"), ("1", "Jan"), ("2", "Feb"), ("3", "Mar"), ("4", "Apr"), ("5", "May"), ("6", "Jun"), ("7", "Jul"), ("8", "Aug"), ("9", "Sep"), ("10", "Oct"), ("11", "Nov"), ("12", "Dec")]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            DividerWithTitle("Filter by")
-            HStack(spacing: 7) {
-                CheckBox(isOn: .constant(true))
-                Text("Flag").frame(width: 54, alignment: .leading)
-                Text("Include").fixedSize()
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack { CheckBox(isOn: .constant(true)); Text("<Unflagged data>") }
-                    HStack { CheckBox(isOn: .constant(true)); Text("Synthesized") }
-                }
-            }
-            HStack(spacing: 5) {
-                CheckBox(isOn: dateBinding)
-                Text("Date").frame(width: 62, alignment: .leading)
-                Text("Year").foregroundStyle(.secondary).fixedSize()
-                Picker("", selection: $selectedYear) {
-                    ForEach(yearOptions, id: \.self) { year in Text(year == "-" ? "<All>" : year).tag(year) }
-                }
-                .labelsHidden()
-                .frame(width: 62)
-                Text("Month").foregroundStyle(.secondary).fixedSize()
-                Picker("", selection: $selectedMonth) {
-                    ForEach(months, id: \.0) { item in Text(item.1).tag(item.0) }
-                }
-                .labelsHidden()
-                .frame(width: 68)
-            }
-            HStack(spacing: 6) {
-                CheckBox(isOn: rangeBinding)
-                Text("Date range").frame(width: 62, alignment: .leading)
-                DatePicker("", selection: dateBinding(for: $rangeStart), in: minDate...maxDate, displayedComponents: .date)
-                    .labelsHidden()
-                    .datePickerStyle(.compact)
-                    .frame(width: 88)
-                Text("to").foregroundStyle(.secondary).fixedSize()
-                DatePicker("", selection: dateBinding(for: $rangeEnd), in: minDate...maxDate, displayedComponents: .date)
-                    .labelsHidden()
-                    .datePickerStyle(.compact)
-                    .frame(width: 88)
-            }
-            HStack(spacing: 6) {
-                CheckBox(isOn: columnBinding)
-                Text("Data column").frame(width: 62, alignment: .leading)
-                Picker("", selection: $filterColumn) {
-                    Text(directionName.isEmpty ? "<All>" : directionName).tag("-")
-                    ForEach(channels) { channel in
-                        Text(channel.name).tag(channel.id)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 202)
-            }
-            HStack(spacing: 8) {
-                Spacer().frame(width: 28)
-                CheckBox(isOn: .constant(true))
-                Text("Min").foregroundStyle(.secondary)
-                TextField("", text: $filterMin)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 52)
-                CheckBox(isOn: .constant(true))
-                Text("Max").foregroundStyle(.secondary)
-                TextField("", text: $filterMax)
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 52)
-            }
-            Text("Range: \(Self.formatDate(minDate)) to \(Self.formatDate(maxDate))")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            Spacer()
-        }
-        .font(.system(size: 11))
-        .padding(8)
-        .background(Color(.controlBackgroundColor).opacity(0.35))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .onChange(of: rangeStart) { _, _ in clampRanges() }
-        .onChange(of: rangeEnd) { _, _ in clampRanges() }
-    }
-
-    private var yearOptions: [String] {
-        ["-"] + years.map(String.init)
-    }
-
-    private var dateBinding: Binding<Bool> {
-        Binding {
-            filterMode == "date"
-        } set: { value in
-            filterMode = value ? "date" : "none"
-        }
-    }
-
-    private var rangeBinding: Binding<Bool> {
-        Binding {
-            filterMode == "range"
-        } set: { value in
-            filterMode = value ? "range" : "none"
-        }
-    }
-
-    private var columnBinding: Binding<Bool> {
-        Binding {
-            filterMode == "column"
-        } set: { value in
-            filterMode = value ? "column" : "none"
-        }
-    }
-
-    private func clampRanges() {
-        if let start = Self.parseDate(rangeStart) {
-            rangeStart = Self.formatDate(min(max(start, minDate), maxDate))
-        }
-        if let end = Self.parseDate(rangeEnd) {
-            rangeEnd = Self.formatDate(min(max(end, minDate), maxDate))
-        }
-    }
-
-    private func dateBinding(for text: Binding<String>) -> Binding<Date> {
-        Binding {
-            Self.parseDate(text.wrappedValue) ?? minDate
-        } set: { value in
-            text.wrappedValue = Self.formatDate(min(max(value, minDate), maxDate))
-        }
-    }
-
-    private static func parseDate(_ value: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: value)
-    }
-
-    private static func formatDate(_ value: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: value)
-    }
-}
-
-private struct DividerWithTitle: View {
-    let title: String
-
-    init(_ title: String) {
-        self.title = title
-    }
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Text(title).foregroundStyle(.secondary)
-            Rectangle().fill(Color(.separatorColor)).frame(height: 1)
-        }
-    }
-}
-
-private struct DisabledInput: View {
-    let value: String
-
-    var body: some View {
-        Text(value)
-            .foregroundStyle(.secondary)
-            .frame(width: 38, height: 20, alignment: .trailing)
-            .padding(.trailing, 4)
-            .background(Color(.controlBackgroundColor).opacity(0.6))
-            .overlay(Rectangle().stroke(Color(.separatorColor).opacity(0.8)))
-    }
-}
-
-private struct DisabledFilterRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack(spacing: 8) {
-            CheckBox(isOn: .constant(false))
-            Text(label).frame(width: 70, alignment: .leading)
-            Text(value)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-        }
-        .foregroundStyle(.secondary)
-    }
-}
-
-private struct EmptyRosePlaceholder: View {
-    var body: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "chart.line.uptrend.xyaxis")
-                .font(.system(size: 30))
-                .foregroundStyle(.secondary)
-            Text("No wind direction data")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        return rows.map { $0.map(quote).joined(separator: delimiter) }.joined(separator: "\r\n") + "\r\n"
     }
 }

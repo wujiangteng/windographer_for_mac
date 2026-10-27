@@ -101,6 +101,15 @@ struct DataColumnConfiguration: Identifiable {
     var max: String
     var associated: AssociatedColumns
     var preview: ColumnPreview
+    var calculation: ColumnCalculation? = nil
+}
+
+/// Local reconstruction: a constant or affine transformation of a stored column.
+struct ColumnCalculation: Codable {
+    var sourceID: String?
+    var multiplier: Double = 1
+    var offset: Double = 0
+    var staticValues: [Double?]? = nil
 }
 
 struct AssociatedColumns: Hashable {

@@ -6,6 +6,15 @@ BUNDLE_ID="com.windlab.mac"
 VERSION="0.1.0"
 BUILD_NUMBER="1"
 MIN_MACOS="14.0"
+BUILD_CONFIGURATION="${WINDLAB_BUILD_CONFIGURATION:-release}"
+if [[ "${BUILD_CONFIGURATION}" != "debug" && "${BUILD_CONFIGURATION}" != "release" ]]; then
+  echo "WINDLAB_BUILD_CONFIGURATION must be debug or release" >&2
+  exit 1
+fi
+SWIFT_BUILD_OPTIONS=(-c "${BUILD_CONFIGURATION}")
+if [[ "${WINDLAB_SWIFTPM_DISABLE_SANDBOX:-0}" == "1" ]]; then
+  SWIFT_BUILD_OPTIONS+=(--disable-sandbox)
+fi
 MACOSICONS_PAGE_URL="https://macosicons.com/?icon=JS6Srjibi5"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,21 +31,15 @@ export CLANG_MODULE_CACHE_PATH="${PROJECT_DIR}/.build/clang-module-cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="${PROJECT_DIR}/.build/swiftpm-module-cache"
 mkdir -p "${CLANG_MODULE_CACHE_PATH}" "${SWIFTPM_MODULECACHE_OVERRIDE}"
 
-echo "==> Building release binary"
+echo "==> Building ${BUILD_CONFIGURATION} binary"
 cd "${PROJECT_DIR}"
-swift build -c release
+swift build "${SWIFT_BUILD_OPTIONS[@]}"
 
-BUILD_DIR="$(swift build -c release --show-bin-path)"
+BUILD_DIR="$(swift build "${SWIFT_BUILD_OPTIONS[@]}" --show-bin-path)"
 BINARY_PATH="${BUILD_DIR}/WindLabMac"
-RESOURCE_BUNDLE="${BUILD_DIR}/WindLabMac_WindLabMac.bundle"
 
 if [[ ! -x "${BINARY_PATH}" ]]; then
-  echo "Release binary not found: ${BINARY_PATH}" >&2
-  exit 1
-fi
-
-if [[ ! -d "${RESOURCE_BUNDLE}" ]]; then
-  echo "Resource bundle not found: ${RESOURCE_BUNDLE}" >&2
+  echo "Built binary not found: ${BINARY_PATH}" >&2
   exit 1
 fi
 
@@ -45,7 +48,6 @@ rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}"
 
 cp "${BINARY_PATH}" "${MACOS_DIR}/${APP_NAME}"
-cp -R "${RESOURCE_BUNDLE}" "${RESOURCES_DIR}/"
 
 ICON_FILE=""
 if [[ -f "${LOCAL_ICON}" ]]; then
@@ -157,6 +159,22 @@ EOF
 
 echo "==> Signing locally"
 codesign --force --deep --sign - "${APP_DIR}"
+
+echo "==> Verifying native-only bundle"
+codesign --verify --deep --strict "${APP_DIR}"
+PYTHON_REMAINDER="$(find "${APP_DIR}" \( -iname '*.py' -o -iname '*.pyc' -o -iname '*.pyo' -o -iname 'Python.framework' -o -iname 'libpython*' \) -print -quit)"
+if [[ -n "${PYTHON_REMAINDER}" ]]; then
+  echo "Unexpected Python artifact in application: ${PYTHON_REMAINDER}" >&2
+  exit 1
+fi
+if /usr/bin/otool -L "${MACOS_DIR}/${APP_NAME}" | /usr/bin/grep -iE 'Python\.framework|libpython'; then
+  echo "Unexpected Python runtime dependency" >&2
+  exit 1
+fi
+if /usr/bin/strings "${MACOS_DIR}/${APP_NAME}" | /usr/bin/grep -E '/usr/bin/python|parse_windog\.py|windlab-decoded-'; then
+  echo "Unexpected legacy parser launcher in binary" >&2
+  exit 1
+fi
 
 echo "==> Done"
 echo "App: ${APP_DIR}"

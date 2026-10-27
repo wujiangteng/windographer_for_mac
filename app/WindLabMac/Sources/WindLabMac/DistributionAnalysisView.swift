@@ -23,6 +23,7 @@ struct DistributionAnalysisView: View {
     @State private var visibleSeries: Set<String> = ["Maximum likelihood", "Least squares", "WAsP", "Actual data"]
     @State private var isLoading = false
     @State private var loadError: String?
+    @State private var calculationID = UUID()
 
     var body: some View {
         VStack(spacing: 0) {
@@ -77,6 +78,7 @@ struct DistributionAnalysisView: View {
         .onChange(of: sensorID) { _, _ in loadAnalysis() }
         .onChange(of: usesCustomBinWidth) { _, _ in loadAnalysis() }
         .onChange(of: usesCustomBinStart) { _, _ in loadAnalysis() }
+        .onChange(of: usesHalfFirstBin) { _, _ in loadAnalysis() }
         .onChange(of: binWidth) { _, _ in loadAnalysis() }
         .onChange(of: binStart) { _, _ in loadAnalysis() }
         .onChange(of: filterMode) { _, _ in loadAnalysis() }
@@ -147,8 +149,9 @@ struct DistributionAnalysisView: View {
 
     private func loadAnalysis() {
         guard let fileURL, !sensorID.isEmpty else { return }
-        let widthValue = usesCustomBinWidth && Double(binWidth) != nil ? binWidth : "-"
-        let startValue = usesCustomBinStart && Double(binStart) != nil ? binStart : "-"
+        let widthValue = usesCustomBinWidth ? binWidth : "-"
+        let startValue = usesCustomBinStart ? binStart : "-"
+        let halfFirstValue = usesHalfFirstBin
         let filterValue = filterMode
         let yearValue = selectedYear
         let monthValue = selectedMonth
@@ -160,6 +163,8 @@ struct DistributionAnalysisView: View {
         let sensorValue = sensorID
         isLoading = true
         loadError = nil
+        let requestID = UUID()
+        calculationID = requestID
 
         Task.detached {
             do {
@@ -175,16 +180,18 @@ struct DistributionAnalysisView: View {
                     rangeEnd: rangeEndValue,
                     filterColumn: filterColumnValue,
                     filterMin: filterMinValue,
-                    filterMax: filterMaxValue
+                    filterMax: filterMaxValue,
+                    halfFirstBin: halfFirstValue
                 )
                 let parsed = DistributionAnalysisData(decoded: decoded)
                 await MainActor.run {
+                    guard calculationID == requestID else { return }
                     analysis = parsed
-                    visibleSeries = Set(parsed.curves.map(\.name))
                     isLoading = false
                 }
             } catch {
                 await MainActor.run {
+                    guard calculationID == requestID else { return }
                     loadError = error.localizedDescription
                     isLoading = false
                 }
@@ -369,9 +376,9 @@ private struct DistributionResultTable: View {
     private func header(_ text: String, width: CGFloat) -> some View {
         Text(text)
             .multilineTextAlignment(.center)
-            .lineLimit(3)
+            .lineLimit(4)
             .minimumScaleFactor(0.8)
-            .frame(width: width, height: 44)
+            .frame(width: width, height: 54)
             .background(Color(.controlBackgroundColor))
             .border(Color(.separatorColor))
     }
@@ -409,7 +416,7 @@ private struct DistributionChart: View {
                     .font(.system(size: 13, weight: .semibold))
                     .position(x: origin.x + size.width / 2, y: 8)
                 ChartGrid(xTicks: xTicks, yTicks: yTicks, xRange: 0...xMax, yRange: 0...yMax, origin: origin, size: size)
-                ForEach(data.bars) { bar in
+                ForEach(visibleSeries.contains("Actual data") ? data.bars : []) { bar in
                     let x0 = mapX(bar.x - bar.width / 2, xMax, origin, size)
                     let x1 = mapX(bar.x + bar.width / 2, xMax, origin, size)
                     let y = mapY(bar.y, yMax, origin, size)

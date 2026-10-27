@@ -1,14 +1,19 @@
 import AppKit
 import SwiftUI
+import WindogCore
 
 struct TimeSeriesView: View {
     let data: TimeSeriesData
     let fileURL: URL?
+    var sourceData: WindExportDataSet? = nil
+    var sourceRevision: UUID? = nil
     @State private var displayMode = "Measured Data"
     @State private var visibleChannels: Set<String> = []
     @State private var loadedSeries: [String: NamedSeries] = [:]
     @State private var loadingChannels: Set<String> = []
     @State private var loadError: String?
+    @State private var loadGeneration = UUID()
+    @State private var loadTasks: [String: Task<Void, Never>] = [:]
 
     private let displayModes = ["Measured Data", "Daily Means", "Monthly Means", "Annual Means"]
 
@@ -21,7 +26,9 @@ struct TimeSeriesView: View {
                     series: visibleSeries,
                     channels: data.channels,
                     monthLabels: data.monthLabels,
-                    startDate: data.startDate
+                    startDate: data.startDate,
+                    endDate: data.endDate,
+                    mode: parserMode
                 )
                 .padding(.leading, 10)
                 .padding(.bottom, 10)
@@ -36,18 +43,22 @@ struct TimeSeriesView: View {
             }
         }
         .onAppear {
-            visibleChannels = Set(data.channels.filter(\.defaultVisible).map(\.id))
+            reloadSeries(resetSelection: true)
         }
-        .onChange(of: data.channels) { _, channels in
-            visibleChannels = Set(channels.filter(\.defaultVisible).map(\.id))
-            loadedSeries.removeAll()
-            loadingChannels.removeAll()
-            loadError = nil
+        .onChange(of: data.channels) { _, _ in
+            reloadSeries(resetSelection: true)
+        }
+        .onChange(of: fileURL) { _, _ in
+            reloadSeries(resetSelection: true)
+        }
+        .onChange(of: sourceRevision) { _, _ in
+            reloadSeries(resetSelection: false)
         }
         .onChange(of: displayMode) { _, _ in
-            loadedSeries.removeAll()
-            loadingChannels.removeAll()
-            visibleChannels.forEach(loadSeriesIfNeeded)
+            reloadSeries(resetSelection: false)
+        }
+        .onDisappear {
+            cancelLoads()
         }
     }
 
@@ -78,14 +89,27 @@ struct TimeSeriesView: View {
             }
 
             Spacer()
+            Text(modeNote)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .help("Uses stored values. Quality-flag intervals and derived-only columns are not evaluated. Direction means use the configured or inferred speed association.")
         }
         .padding(.horizontal, 14)
         .frame(height: 36)
         .background(Color(.windowBackgroundColor))
     }
 
+    private var modeNote: String {
+        switch parserMode {
+        case "daily": "Recovery ≥75% · flags not filtered"
+        case "monthly": "Recovery ≥80% · flags not filtered"
+        case "annual": "Recovery ≥90% · flags not filtered"
+        default: "Stored values · flags not filtered"
+        }
+    }
+
     private var visibleSeries: [NamedSeries] {
-        visibleChannels.compactMap { loadedSeries[seriesKey($0)] }
+        data.channels.filter { visibleChannels.contains($0.id) }.compactMap { loadedSeries[seriesKey($0.id)] }
     }
 
     private var parserMode: String {
@@ -106,28 +130,64 @@ struct TimeSeriesView: View {
         }
     }
 
+    private func cancelLoads() {
+        loadGeneration = UUID()
+        loadTasks.values.forEach { $0.cancel() }
+        loadTasks.removeAll()
+        loadingChannels.removeAll()
+    }
+
+    private func reloadSeries(resetSelection: Bool) {
+        cancelLoads()
+        loadedSeries.removeAll()
+        loadError = nil
+        let available = Set(data.channels.map(\.id))
+        if resetSelection {
+            visibleChannels = Set(data.channels.filter(\.defaultVisible).map(\.id))
+        } else {
+            visibleChannels.formIntersection(available)
+        }
+        data.channels.filter { visibleChannels.contains($0.id) }.forEach { loadSeriesIfNeeded($0.id) }
+    }
+
     private func loadSeriesIfNeeded(_ id: String) {
         let key = seriesKey(id)
-        guard loadedSeries[key] == nil, !loadingChannels.contains(id), let fileURL else {
-            return
-        }
+        guard loadedSeries[key] == nil, !loadingChannels.contains(id),
+              let channel = data.channels.first(where: { $0.id == id }),
+              sourceData != nil || fileURL != nil else { return }
         let mode = parserMode
+        let generation = loadGeneration
+        let dataset = sourceData
+        let url = fileURL
         loadingChannels.insert(id)
         loadError = nil
 
-        Task.detached {
+        loadTasks[id] = Task.detached {
             do {
-                let decoded = try WindogParser.parseTimeSeries(fileURL: fileURL, channelID: id, mode: mode)
-                let series = NamedSeries(decoded: decoded)
+                let decoded: DecodedSeries
+                if let dataset {
+                    decoded = try NativeTimeSeriesAnalysis.series(dataset: dataset, channelID: id, mode: mode)
+                } else if let url {
+                    decoded = try WindogParser.parseTimeSeries(fileURL: url, channelID: id, mode: mode)
+                } else {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                let series = NamedSeries(name: id, colorName: channel.colorName,
+                                         points: decoded.points.map { SeriesPoint(x: $0.x, y: $0.y) })
                 await MainActor.run {
+                    guard loadGeneration == generation else { return }
                     loadedSeries[key] = series
                     loadingChannels.remove(id)
+                    loadTasks.removeValue(forKey: id)
                 }
             } catch {
+                guard !Task.isCancelled else { return }
                 await MainActor.run {
+                    guard loadGeneration == generation else { return }
                     loadError = error.localizedDescription
                     loadingChannels.remove(id)
-                    visibleChannels.remove(id)
+                    loadTasks.removeValue(forKey: id)
                 }
             }
         }
@@ -194,10 +254,10 @@ struct TimeSeriesChannelList: View {
 
     private var allWindSpeedSelected: Binding<Bool> {
         Binding {
-            let speedChannels = channels.filter { $0.unit == "m/s" }
+            let speedChannels = channels.filter { $0.kind == "wind_speed" || $0.kind == "wind_speed_synthesized" }
             return !speedChannels.isEmpty && speedChannels.allSatisfy { visibleChannels.contains($0.id) }
         } set: { newValue in
-            channels.filter { $0.unit == "m/s" }.forEach { toggleChannel($0.id, newValue) }
+            channels.filter { $0.kind == "wind_speed" || $0.kind == "wind_speed_synthesized" }.forEach { toggleChannel($0.id, newValue) }
         }
     }
 
@@ -239,6 +299,8 @@ struct TimeSeriesChart: View {
     let channels: [TimeSeriesChannel]
     let monthLabels: [TimeAxisLabel]
     let startDate: Date
+    let endDate: Date
+    let mode: String
     @State private var visibleRange: ClosedRange<Double>?
     @State private var selectionStartX: CGFloat?
     @State private var selectionCurrentX: CGFloat?
@@ -272,27 +334,11 @@ struct TimeSeriesChart: View {
                     origin: origin,
                     size: plotSize
                 )
-                ChartSeriesLayer(
-                    series: leftAxisSeries,
-                    xRange: xRange,
-                    yRange: leftYRange,
-                    origin: origin,
-                    size: plotSize,
-                    markerSeriesName: nil,
-                    markerMode: .none
-                )
-                .mask(plotMask)
-                if !rightAxisSeries.isEmpty {
-                    ChartSeriesLayer(
-                        series: rightAxisSeries,
-                        xRange: xRange,
-                        yRange: rightYRange,
-                        origin: origin,
-                        size: plotSize,
-                        markerSeriesName: nil,
-                        markerMode: .none
-                    )
+                seriesLayer(for: leftAxisSeries, range: leftYRange, origin: origin, size: plotSize)
                     .mask(plotMask)
+                if !rightAxisSeries.isEmpty {
+                    seriesLayer(for: rightAxisSeries, range: rightYRange, origin: origin, size: plotSize)
+                        .mask(plotMask)
                 }
                 Rectangle()
                     .stroke(Color.black, lineWidth: 1)
@@ -352,12 +398,35 @@ struct TimeSeriesChart: View {
                 .position(x: origin.x + plotSize.width / 2, y: origin.y + plotSize.height / 2)
             }
             .clipped()
-            .onChange(of: fullRange.upperBound) { _, _ in
+            .onChange(of: fullRange) { _, _ in
+                visibleRange = fullRange
+            }
+            .onChange(of: startDate) { _, _ in
                 visibleRange = fullRange
             }
             .onAppear {
                 visibleRange = fullRange
             }
+        }
+    }
+
+    private func seriesLayer(for axisSeries: [NamedSeries], range: ClosedRange<Double>,
+                             origin: CGPoint, size: CGSize) -> some View {
+        let rendered = axisSeries.map { series in
+            NamedSeries(name: series.name, colorName: series.colorName,
+                        points: TimeSeriesRendering.reduce(points: series.points,
+                                                           range: visibleRange ?? fullXRange,
+                                                           pixelWidth: max(1, Int(size.width.rounded(.up)))))
+        }
+        return ZStack(alignment: .topLeading) {
+            ChartSeriesLayer(series: rendered, xRange: visibleRange ?? fullXRange,
+                             yRange: range, origin: origin, size: size,
+                             markerSeriesName: nil, markerMode: .none)
+            // A one-period aggregate has no line segment; show its actual point.
+            ChartSeriesLayer(series: rendered.filter {
+                $0.points.filter { $0.x.isFinite && $0.y.isFinite }.count == 1
+            }, xRange: visibleRange ?? fullXRange, yRange: range, origin: origin,
+                             size: size, markerSeriesName: nil, markerMode: .all)
         }
     }
 
@@ -397,15 +466,24 @@ struct TimeSeriesChart: View {
     }
 
     private var rightAxisLabel: String {
-        axisLabel(for: rightAxisSeries, fallback: "Wind speed")
+        axisLabel(for: rightAxisSeries, fallback: "Selected data")
     }
 
     private var fullXRange: ClosedRange<Double> {
-        let maxX = max(series.flatMap(\.points).map(\.x).max() ?? monthLabels.last?.x ?? 365, 1)
-        return 0...maxX
+        let duration = max(endDate.timeIntervalSince(startDate) / 86400, 1.0 / 1440)
+        guard mode != "measured" else { return 0...duration }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let component: Calendar.Component = mode == "daily" ? .day : mode == "monthly" ? .month : .year
+        guard let first = calendar.dateInterval(of: component, for: startDate),
+              let last = calendar.dateInterval(of: component, for: endDate.addingTimeInterval(-0.001)) else {
+            return 0...duration
+        }
+        return first.start.timeIntervalSince(startDate) / 86400...last.end.timeIntervalSince(startDate) / 86400
     }
 
     private func axisLabel(for axisSeries: [NamedSeries], fallback: String) -> String {
+        guard !axisSeries.isEmpty else { return fallback }
         guard axisSeries.count == 1, let item = axisSeries.first, let channel = channelByID[item.name] else {
             if axisSeries.allSatisfy({ channelByID[$0.name]?.kind == "wind_direction" }) {
                 return "\(fallback) (°)"
@@ -428,7 +506,14 @@ struct TimeSeriesChart: View {
             return 0...30
         }
         let padding = max((maxValue - minValue) * 0.08, 1)
-        let lower = max(0, floor((minValue - padding) / 5) * 5)
+        // Range padding is a local display choice; negative temperature and
+        // vertical-speed observations must remain visible.
+        let nonnegative = axisSeries.allSatisfy { item in
+            guard let kind = channelByID[item.name]?.kind else { return false }
+            return ["wind_speed", "wind_speed_synthesized", "power_density", "pressure", "density", "humidity"].contains(kind)
+        }
+        let paddedLower = floor((minValue - padding) / 5) * 5
+        let lower = nonnegative ? max(0, paddedLower) : paddedLower
         let upper = max(lower + 1, ceil((maxValue + padding) / 5) * 5)
         return lower...upper
     }
@@ -456,9 +541,28 @@ struct TimeSeriesChart: View {
 
     private func xAxisLabels(in range: ClosedRange<Double>) -> [TimeAxisLabel] {
         let span = range.upperBound - range.lowerBound
-        let calendar = Calendar.current
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = calendar.timeZone
+
+        if mode == "monthly" || mode == "annual" {
+            let component: Calendar.Component = mode == "monthly" ? .month : .year
+            let lowerDate = startDate.addingTimeInterval(range.lowerBound * 86400)
+            var cursor = calendar.dateInterval(of: component, for: lowerDate)!.start
+            var labels: [TimeAxisLabel] = []
+            formatter.dateFormat = mode == "annual" ? "yyyy" : "MMM yyyy"
+            while cursor <= startDate.addingTimeInterval(range.upperBound * 86400) {
+                guard let period = calendar.dateInterval(of: component, for: cursor) else { break }
+                let x = period.start.addingTimeInterval(period.duration / 2).timeIntervalSince(startDate) / 86400
+                if range.contains(x) { labels.append(TimeAxisLabel(x: x, label: formatter.string(from: cursor))) }
+                cursor = period.end
+            }
+            // Keep labels readable for long records while preserving mean positions.
+            let strideCount = max(1, Int(ceil(Double(labels.count) / 12)))
+            return labels.enumerated().filter { $0.offset % strideCount == 0 }.map(\.element)
+        }
 
         let stepDays: Double
         if span <= 2 {
@@ -489,7 +593,9 @@ struct TimeSeriesChart: View {
         let current = visibleRange ?? fullRange
         let span = current.upperBound - current.lowerBound
         let factor = exp(-deltaY * 0.003)
-        let newSpan = min(max(span * factor, 7), fullRange.upperBound - fullRange.lowerBound)
+        let fullSpan = fullRange.upperBound - fullRange.lowerBound
+        let minimumSpan = min(fullSpan, 1.0 / 1440)
+        let newSpan = min(max(span * factor, minimumSpan), fullSpan)
         let anchorFraction = min(max(Double(locationX / max(plotWidth, 1)), 0), 1)
         let anchorValue = current.lowerBound + span * anchorFraction
         let lower = anchorValue - newSpan * anchorFraction

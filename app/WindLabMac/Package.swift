@@ -11,11 +11,13 @@ let package = Package(
         .executable(name: "WindLabMac", targets: ["WindLabMac"])
     ],
     targets: [
+        .systemLibrary(name: "CZlib"),
+        .target(name: "WindogCore", dependencies: ["CZlib"]),
         .executableTarget(
             name: "WindLabMac",
-            resources: [
-                .copy("Python/parse_windog.py")
-            ]
-        )
+            dependencies: ["WindogCore"]
+        ),
+        .testTarget(name: "WindogCoreTests", dependencies: ["WindogCore"]),
+        .testTarget(name: "WindLabMacTests", dependencies: ["WindLabMac", "WindogCore"])
     ]
 )

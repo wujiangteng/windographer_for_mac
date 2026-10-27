@@ -1,5 +1,7 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
+import WindogCore
 
 @MainActor
 private final class ColorPanelBridge: NSObject {
@@ -20,14 +22,23 @@ struct ConfigureDataSetView: View {
     @State private var isLoadingConfiguration = false
     @State private var configurationError: String?
     @State private var showsColorPalette = false
+    @State private var cachedSource: WindExportDataSet?
+    @State private var selectedColumnIDs = Set<String>()
+    @State private var showsCalculation = false
+    @State private var calculationSource = "<constant>"
+    @State private var calculationMultiplier = 1.0
+    @State private var calculationOffset = 0.0
+    let sourceData: WindExportDataSet?
     let configuration: DataSetConfiguration
     let fileURL: URL?
     let apply: (DataSetConfiguration) -> Void
     let cancel: () -> Void
 
-    init(configuration: DataSetConfiguration, fileURL: URL?, apply: @escaping (DataSetConfiguration) -> Void, cancel: @escaping () -> Void) {
+    init(configuration: DataSetConfiguration, fileURL: URL?, sourceData: WindExportDataSet? = nil, apply: @escaping (DataSetConfiguration) -> Void, cancel: @escaping () -> Void) {
         _draft = State(initialValue: configuration)
         _selectedColumnID = State(initialValue: configuration.columns.first?.id)
+        _cachedSource = State(initialValue: sourceData)
+        self.sourceData = sourceData
         self.configuration = configuration
         self.fileURL = fileURL
         self.apply = apply
@@ -52,17 +63,31 @@ struct ConfigureDataSetView: View {
             if selectedTab == "Data Columns" {
                 dataColumnsView
             } else {
-                dataSetView
+                ScrollView { dataSetView }
             }
 
+            Text("All stored valid values · quality flags are not filtered · units edit labels only")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let configurationError {
+                Text(configurationError).font(.caption).foregroundStyle(.red).padding(.horizontal)
+            }
             HStack(spacing: 6) {
-                Button("Help") {}
+                Button("Help") {
+                    let alert = NSAlert()
+                    alert.messageText = "Configure Data Set"
+                    alert.informativeText = "Edit column roles, units, heights, visibility and associations. Previews use all stored valid values; quality flags are not filtered. New TXT/CSV/TSV imports remain pending until OK. Templates use WindLab JSON and map columns by position. Calculated columns support constants and source × multiplier + offset. Unit labels do not convert samples. Cancel discards draft edits."
+                    alert.runModal()
+                }
                     .frame(width: 72)
                 Spacer()
                 Button("Cancel", action: cancel)
                     .frame(width: 72)
                 Button("OK") {
-                    apply(draft)
+                    do {
+                        try ConfigurationEditing.validate(draft)
+                        if let cachedSource { _ = try ConfigurationEditing.apply(cachedSource, draft) }
+                        apply(draft)
+                    } catch { configurationError = error.localizedDescription }
                 }
                 .keyboardShortcut(.defaultAction)
                 .frame(width: 72)
@@ -70,8 +95,10 @@ struct ConfigureDataSetView: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
         }
-        .frame(width: 1140, height: 820)
+        .padding(.top, 8)
+        .frame(width: panelSize.width, height: panelSize.height)
         .background(Color(.windowBackgroundColor))
+        .sheet(isPresented: $showsCalculation) { calculationEditor }
         .onAppear {
             ensureSelection()
         }
@@ -87,15 +114,18 @@ struct ConfigureDataSetView: View {
         }
     }
 
-    private let labelWidth: CGFloat = 286
-    private let unitWidth: CGFloat = 70
-    private let colorWidth: CGFloat = 60
-    private let heightWidth: CGFloat = 76
-    private let statWidth: CGFloat = 78
-
-    private var tableWidth: CGFloat {
-        labelWidth + unitWidth + colorWidth + heightWidth + statWidth * 3
+    private var panelSize: CGSize {
+        let available = NSScreen.main?.visibleFrame.size ?? CGSize(width: 1440, height: 1000)
+        return CGSize(width: max(760, min(1320, available.width - 64)),
+                      height: max(560, min(900, available.height - 100)))
     }
+    private var propertiesWidth: CGFloat { max(280, panelSize.width * 0.34) }
+    private let unitWidth: CGFloat = 44
+    private let colorWidth: CGFloat = 24
+    private let heightWidth: CGFloat = 50
+    private let statWidth: CGFloat = 50
+    private var tableWidth: CGFloat { panelSize.width - propertiesWidth - 38 }
+    private var labelWidth: CGFloat { tableWidth - unitWidth - colorWidth - heightWidth - statWidth * 3 }
 
     private var dataColumnsView: some View {
         VStack(spacing: 8) {
@@ -106,10 +136,8 @@ struct ConfigureDataSetView: View {
                 Spacer()
                 Button("Assign Default Colors to All Columns", action: assignDefaultColors)
                 Spacer()
-                Button("Save Template...") {}
-                    .disabled(true)
-                Button("Load Template...") {}
-                    .disabled(true)
+                Button("Save Template...", action: saveTemplate)
+                Button("Load Template...", action: loadTemplate)
             }
             .font(.system(size: 12))
 
@@ -117,19 +145,23 @@ struct ConfigureDataSetView: View {
                 columnTable
                     .frame(width: tableWidth)
                 Divider()
-                columnProperties
-                    .frame(width: 350)
+                ScrollView { columnProperties }
+                    .frame(width: propertiesWidth)
             }
 
+            Text("Preview: \(selectedColumn?.label ?? "—")")
+                .font(.system(size: 11)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
             HStack(spacing: 8) {
                 PDFPreviewChart(column: selectedColumn, isLoading: isSelectedPreviewLoading, errorMessage: previewError)
                 DiurnalPreviewChart(column: selectedColumn, isLoading: isSelectedPreviewLoading, errorMessage: previewError)
                 MonthlyStatisticsPreviewChart(column: selectedColumn, isLoading: isSelectedPreviewLoading, errorMessage: previewError)
             }
-            .frame(height: 178)
+            .frame(height: max(170, min(220, panelSize.height * 0.25)))
         }
         .padding(.horizontal, 10)
-        .task(id: selectedColumnID) {
+        .task(id: previewSignature) {
             await loadSelectedPreviewIfNeeded()
         }
     }
@@ -166,6 +198,10 @@ struct ConfigureDataSetView: View {
 
     private func columnRow(_ column: DataColumnConfiguration) -> some View {
         Button {
+            if NSEvent.modifierFlags.contains(.command) {
+                if selectedColumnIDs.contains(column.id) { selectedColumnIDs.remove(column.id) }
+                else { selectedColumnIDs.insert(column.id) }
+            } else { selectedColumnIDs = [column.id] }
             selectedColumnID = column.id
             previewError = nil
         } label: {
@@ -175,10 +211,13 @@ struct ConfigureDataSetView: View {
                         .foregroundStyle(Color.chartColor(column.colorName))
                         .frame(width: 16)
                     Text(column.label)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(column.label)
                     Spacer()
                 }
-                .frame(width: labelWidth, height: 22)
+                .frame(width: labelWidth, alignment: .leading)
+                .frame(minHeight: 30)
+                .padding(.vertical, 3)
                 Text(column.unit).frame(width: unitWidth, height: 22)
                 Rectangle()
                     .fill(Color.chartColor(column.colorName))
@@ -189,7 +228,7 @@ struct ConfigureDataSetView: View {
                 Text(column.max).frame(width: statWidth, height: 22)
             }
             .font(.system(size: 12))
-            .background(selectedColumnID == column.id ? Color.accentColor.opacity(0.20) : Color.white)
+            .background((selectedColumnIDs.contains(column.id) || selectedColumnID == column.id) ? Color.accentColor.opacity(0.20) : Color.white)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -208,12 +247,15 @@ struct ConfigureDataSetView: View {
                     .labelsHidden()
                 }
                 configRow("Subtype") {
-                    Text(binding.wrappedValue.subtype)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Picker("Subtype", selection: binding.subtype) {
+                        ForEach(["Mean", "Max", "Min", "Std. dev.", "Gust"], id: \.self) { Text($0).tag($0) }
+                    }.labelsHidden()
                 }
                 configRow("Label") {
-                    TextField("", text: binding.label)
+                    TextField("", text: binding.label, axis: .vertical)
+                        .lineLimit(2...5)
                         .textFieldStyle(.roundedBorder)
+                        .help(binding.wrappedValue.label)
                 }
                 configRow("Units") {
                     TextField("", text: binding.unit)
@@ -241,11 +283,11 @@ struct ConfigureDataSetView: View {
                 associationPicker("Speed", binding.associated.speed)
 
                 Spacer()
-                Button("Edit Calculation Properties...") {}
-                    .disabled(true)
+                Button("Edit Calculation Properties...", action: editCalculation)
+                    .disabled(binding.wrappedValue.calculation == nil)
                     .frame(width: 230)
-                Button("Make Static Copy") {}
-                    .disabled(true)
+                Button("Make Static Copy", action: makeStaticCopy)
+                    .disabled(cachedSource == nil)
                     .frame(width: 230)
             } else {
                 Text("No data column selected")
@@ -356,37 +398,35 @@ struct ConfigureDataSetView: View {
         return previewLoadingID == selectedColumnID
     }
 
+    private var previewSignature: String {
+        let c = selectedColumn
+        return "\(selectedColumnID ?? "")|\(c?.type ?? "")|\(c?.subtype ?? "")|\(draft.dataSet.invalidValue)|\(draft.dataSet.timestampsIndicate)|\(c?.calculation?.sourceID ?? "")|\(c?.calculation?.multiplier ?? 1)|\(c?.calculation?.offset ?? 0)"
+    }
+
     private func loadSelectedPreviewIfNeeded() async {
-        guard let fileURL, let selectedColumnID else { return }
-        guard let index = draft.columns.firstIndex(where: { $0.id == selectedColumnID }) else { return }
-        let preview = draft.columns[index].preview
-        guard preview.pdf.isEmpty && preview.diurnal.isEmpty && preview.monthly.isEmpty else { return }
-
-        await MainActor.run {
-            previewLoadingID = selectedColumnID
-            previewError = nil
-        }
-
+        guard let id = selectedColumnID, let source = cachedSource else { return }
+        previewLoadingID = id
+        previewError = nil
+        let snapshot = draft
+        let signature = previewSignature
         do {
-            let decoded = try await Task.detached(priority: .userInitiated) {
-                try WindogParser.parseConfigurationPreview(fileURL: fileURL, channelID: selectedColumnID)
+            let (mapped, mean, minimum, maximum) = try await Task.detached(priority: .userInitiated) {
+                let configured = try ConfigurationEditing.apply(source, snapshot)
+                let preview = try NativeConfigurationAnalysis.preview(dataset: configured, channelID: id)
+                let column = configured.columns.first { $0.id == id }!
+                let stats = NativeConfigurationAnalysis.statistics(column: column)
+                return (ColumnPreview(decoded: preview), NativeConfigurationAnalysis.formatted(stats.mean), NativeConfigurationAnalysis.formatted(stats.minimum), NativeConfigurationAnalysis.formatted(stats.maximum))
             }.value
-            let mapped = ColumnPreview(decoded: decoded)
-            await MainActor.run {
-                if let currentIndex = draft.columns.firstIndex(where: { $0.id == selectedColumnID }) {
-                    draft.columns[currentIndex].preview = mapped
-                }
-                if previewLoadingID == selectedColumnID {
-                    previewLoadingID = nil
-                }
+            guard !Task.isCancelled, signature == previewSignature else { return }
+            if let index = draft.columns.firstIndex(where: { $0.id == id }) {
+                draft.columns[index].preview = mapped
+                draft.columns[index].mean = mean; draft.columns[index].min = minimum; draft.columns[index].max = maximum
             }
+            previewLoadingID = nil
         } catch {
-            await MainActor.run {
-                if previewLoadingID == selectedColumnID {
-                    previewLoadingID = nil
-                }
-                previewError = error.localizedDescription
-            }
+            guard !Task.isCancelled, signature == previewSignature else { return }
+            previewLoadingID = nil
+            previewError = error.localizedDescription
         }
     }
 
@@ -415,30 +455,21 @@ struct ConfigureDataSetView: View {
     }
 
     private func loadConfigurationIfNeeded() async {
-        guard draft.columns.isEmpty, !isLoadingConfiguration, let fileURL else {
-            ensureSelection()
-            return
-        }
-        await MainActor.run {
-            isLoadingConfiguration = true
-            configurationError = nil
-        }
+        guard !isLoadingConfiguration else { return }
+        isLoadingConfiguration = true
         do {
-            let decoded = try await Task.detached(priority: .userInitiated) {
-                try WindogParser.parseConfiguration(fileURL: fileURL)
-            }.value
-            let loaded = DataSetConfiguration(decoded: decoded)
-            await MainActor.run {
-                draft = loaded
-                selectedColumnID = loaded.columns.first?.id
-                isLoadingConfiguration = false
-                configurationError = nil
+            if cachedSource == nil, let fileURL {
+                cachedSource = try await Task.detached { try WindogParser.exportDataSet(fileURL: fileURL) }.value
             }
+            if draft.columns.isEmpty, let cachedSource {
+                draft = DataSetConfiguration(decoded: NativeConfigurationAnalysis.configuration(dataset: cachedSource, fileName: fileURL?.lastPathComponent ?? cachedSource.name))
+            }
+            ensureSelection()
+            isLoadingConfiguration = false
+            await loadSelectedPreviewIfNeeded()
         } catch {
-            await MainActor.run {
-                isLoadingConfiguration = false
-                configurationError = error.localizedDescription
-            }
+            isLoadingConfiguration = false
+            configurationError = error.localizedDescription
         }
     }
 
@@ -453,7 +484,7 @@ struct ConfigureDataSetView: View {
     }
 
     private var columnTypes: [String] {
-        ["Wind Speed", "Vert. Wind Speed", "Wind Direction", "Temperature", "Air Pressure", "Relative Humidity", "Wind Turbine Output", "Quality", "Other"]
+        ["Wind Speed", "Vert. Wind Speed", "Wind Direction", "Temperature", "Air Pressure", "Relative Humidity", "Wind Turbine Output", "Turbulence Intensity", "Air Density", "Wind Power Density", "Quality", "Other"]
     }
 
     private var colorNames: [String] {
@@ -498,15 +529,28 @@ struct ConfigureDataSetView: View {
         }
     }
 
+    @ViewBuilder
     private func associationPicker(_ label: String, _ selection: Binding<String>) -> some View {
         configRow(label) {
             Picker("", selection: selection) {
-                ForEach(allColumnNames, id: \.self) { name in
-                    Text(name).tag(name)
-                }
+                Text("<none>").tag("<none>")
+                if label == "Speed" { Text("<nearest in height>").tag("<nearest in height>") }
+                ForEach(associationCandidates(label)) { column in Text(column.label).tag(column.id) }
             }
             .labelsHidden()
+            .help(associationLabel(selection.wrappedValue))
         }
+        if selection.wrappedValue != "<none>" && selection.wrappedValue != "<nearest in height>" {
+            Text(associationLabel(selection.wrappedValue))
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .padding(.leading, 82)
+        }
+    }
+
+    private func associationLabel(_ id: String) -> String {
+        draft.columns.first { $0.id == id }?.label ?? id
     }
 
     private func colorControl(_ colorName: Binding<String>) -> some View {
@@ -649,7 +693,7 @@ struct ConfigureDataSetView: View {
 
     private func addColumn() {
         let newColumn = DataColumnConfiguration(
-            id: "New Column \(draft.columns.count + 1)",
+            id: "calculated-\(UUID().uuidString)",
             label: "New Column",
             unit: "",
             type: "Other",
@@ -661,15 +705,26 @@ struct ConfigureDataSetView: View {
             min: "-",
             max: "-",
             associated: AssociatedColumns(stdDev: "<none>", min: "<none>", max: "<none>", speed: "<none>"),
-            preview: .empty
+            preview: .empty,
+            calculation: ColumnCalculation(sourceID: nil)
         )
         draft.columns.append(newColumn)
         selectedColumnID = newColumn.id
+        selectedColumnIDs = [newColumn.id]
+        editCalculation()
     }
 
     private func deleteSelectedColumn() {
         guard let selectedColumnID else { return }
-        draft.columns.removeAll { $0.id == selectedColumnID }
+        let ids = selectedColumnIDs.union([selectedColumnID])
+        draft.columns.removeAll { ids.contains($0.id) }
+        for i in draft.columns.indices {
+            if ids.contains(draft.columns[i].associated.stdDev) { draft.columns[i].associated.stdDev = "<none>" }
+            if ids.contains(draft.columns[i].associated.min) { draft.columns[i].associated.min = "<none>" }
+            if ids.contains(draft.columns[i].associated.max) { draft.columns[i].associated.max = "<none>" }
+            if ids.contains(draft.columns[i].associated.speed) { draft.columns[i].associated.speed = "<nearest in height>" }
+        }
+        selectedColumnIDs = []
         self.selectedColumnID = draft.columns.first?.id
     }
 
@@ -733,8 +788,8 @@ private func previewPDFXAxisScale(for column: DataColumnConfiguration?, bars: [H
         let values = bars.flatMap { [$0.x - $0.width / 2, $0.x + $0.width / 2] }
         return niceAxis(values: values, fallback: 95...105, includeZero: false, maxTickCount: 5)
     default:
-        let upper = max(bars.map { $0.x + $0.width / 2 }.max() ?? 1, 1)
-        return niceAxis(values: [0, upper], fallback: 0...1, includeZero: true, maxTickCount: 5)
+        let values = bars.flatMap { [$0.x - $0.width / 2, $0.x + $0.width / 2] }
+        return niceAxis(values: values, fallback: 0...1, includeZero: column?.unit == "m/s", maxTickCount: 5)
     }
 }
 
@@ -830,11 +885,12 @@ private struct DiurnalPreviewChart: View {
                         let x0 = frame.x(point.x, in: 0...24)
                         let x1 = frame.x(point.x + 1, in: 0...24)
                         let y = frame.y(point.y, in: yScale.range)
+                        let baseline = frame.y(min(max(0, yScale.range.lowerBound), yScale.range.upperBound), in: yScale.range)
                         Rectangle()
                             .fill(Color.chartColor(column?.colorName ?? "primary"))
                             .overlay(Rectangle().stroke(.black, lineWidth: 0.5))
-                            .frame(width: max(x1 - x0 - 1, 1), height: frame.bottomY - y)
-                            .position(x: (x0 + x1) / 2, y: y + (frame.bottomY - y) / 2)
+                            .frame(width: max(x1 - x0 - 1, 1), height: abs(baseline - y))
+                            .position(x: (x0 + x1) / 2, y: (y + baseline) / 2)
                     }
                     PreviewAxes(frame: frame, xTicks: [0, 6, 12, 18, 24], yTicks: yScale.ticks, xRange: 0...24, yRange: yScale.range, xLabel: "Time Of Day", yLabel: "Mean Value (\(column?.unit ?? "-"))")
                     PreviewStatusOverlay(isLoading: isLoading, errorMessage: errorMessage, isEmpty: points.isEmpty)
@@ -851,13 +907,13 @@ private struct MonthlyStatisticsPreviewChart: View {
     private let labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
     var body: some View {
-        PreviewPanel(title: "Monthly Statistics for \(column?.label ?? "")") {
+        PreviewPanel(title: "Monthly Statistics") {
             GeometryReader { geometry in
                 let stats = column?.preview.monthly ?? []
                 let values = stats.flatMap { [$0.min, $0.q1, $0.mean, $0.q3, $0.max] }
                 let yScale = previewYAxisScale(for: column, values: values, fallback: 0...5)
                 let xTicks = Array(0..<12).map { Double($0) + 0.5 }
-                let frame = PlotFrame(size: geometry.size, left: 36, right: 42, top: 8, bottom: 32)
+                let frame = PlotFrame(size: geometry.size, left: 36, right: 75, top: 8, bottom: 32)
                 ZStack(alignment: .topLeading) {
                     PreviewGrid(frame: frame, xTicks: xTicks, yTicks: yScale.ticks, xRange: 0...12, yRange: yScale.range)
                     ForEach(stats) { item in
@@ -886,13 +942,13 @@ private struct MonthlyStatisticsPreviewChart: View {
                     PreviewAxes(frame: frame, xTicks: xTicks, yTicks: yScale.ticks, xRange: 0...12, yRange: yScale.range, xLabels: labels, xLabel: "", yLabel: "")
                     VStack(alignment: .leading, spacing: 2) {
                         Text("max")
-                        Text("q3")
+                        Text("avg daily max")
                         Text("mean")
-                        Text("q1")
+                        Text("avg daily min")
                         Text("min")
                     }
                     .font(.system(size: 9))
-                    .position(x: frame.rightX + 22, y: frame.topY + 34)
+                    .position(x: frame.rightX + 37, y: frame.topY + 34)
                     PreviewStatusOverlay(isLoading: isLoading, errorMessage: errorMessage, isEmpty: stats.isEmpty)
                 }
             }
@@ -1045,5 +1101,94 @@ private struct PreviewAxes: View {
 
     private func format(_ value: Double) -> String {
         abs(value.rounded() - value) < 0.001 ? String(Int(value.rounded())) : String(format: "%.1f", value)
+    }
+}
+
+private extension ConfigureDataSetView {
+    func associationCandidates(_ role: String) -> [DataColumnConfiguration] {
+        draft.columns.filter { column in
+            guard column.id != selectedColumnID else { return false }
+            if role == "Speed" { return column.type == "Wind Speed" && column.subtype == "Mean" }
+            let subtype = role == "Std. dev." ? "Std. dev." : role == "Min." ? "Min" : "Max"
+            return column.type == selectedColumn?.type && column.subtype == subtype
+        }
+    }
+    func saveTemplate() {
+        let panel = NSSavePanel()
+        panel.title = "Save WindLab Configuration Template"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "Configuration.windlab-template.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try ConfigurationEditing.validate(draft)
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            try encoder.encode(ConfigurationTemplate(draft)).write(to: url, options: .atomic)
+        } catch { configurationError = error.localizedDescription }
+    }
+    func loadTemplate() {
+        let panel = NSOpenPanel()
+        panel.title = "Load WindLab Configuration Template"
+        panel.allowedContentTypes = [.json]; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            draft = try JSONDecoder().decode(ConfigurationTemplate.self, from: Data(contentsOf: url)).applying(to: draft)
+            configurationError = nil
+            Task { await loadSelectedPreviewIfNeeded() }
+        } catch { configurationError = error.localizedDescription }
+    }
+    func editCalculation() {
+        guard let calculation = selectedColumn?.calculation else { return }
+        calculationSource = calculation.sourceID ?? "<constant>"
+        calculationMultiplier = calculation.multiplier
+        calculationOffset = calculation.offset
+        showsCalculation = true
+    }
+    var calculationEditor: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Calculated Column").font(.headline)
+            Text("Value = source × multiplier + offset. A constant uses the offset only.")
+                .font(.caption).foregroundStyle(.secondary)
+            Picker("Source", selection: $calculationSource) {
+                Text("Constant").tag("<constant>")
+                ForEach(draft.columns.filter { $0.id != selectedColumnID }) { Text($0.label).tag($0.id) }
+            }
+            TextField("Multiplier", value: $calculationMultiplier, format: .number).disabled(calculationSource == "<constant>")
+            TextField("Offset / constant", value: $calculationOffset, format: .number)
+            if selectedColumn?.calculation?.staticValues != nil { Text("Applying a formula replaces this static snapshot.").font(.caption) }
+            HStack {
+                Button("Cancel") { showsCalculation = false }
+                Spacer()
+                Button("Apply") {
+                    guard let index = draft.columns.firstIndex(where: { $0.id == selectedColumnID }) else { return }
+                    let previous = draft.columns[index].calculation
+                    draft.columns[index].calculation = ColumnCalculation(sourceID: calculationSource == "<constant>" ? nil : calculationSource,
+                        multiplier: calculationMultiplier, offset: calculationOffset)
+                    do {
+                        if let cachedSource { _ = try ConfigurationEditing.apply(cachedSource, draft) }
+                        draft.columns[index].preview = .empty
+                        showsCalculation = false
+                        configurationError = nil
+                        Task { await loadSelectedPreviewIfNeeded() }
+                    } catch {
+                        draft.columns[index].calculation = previous
+                        configurationError = error.localizedDescription
+                    }
+                }.keyboardShortcut(.defaultAction)
+            }
+        }.textFieldStyle(.roundedBorder).padding(20).frame(width: 460)
+    }
+    func makeStaticCopy() {
+        guard let source = cachedSource, let selected = selectedColumn else { return }
+        do {
+            let configured = try ConfigurationEditing.apply(source, draft)
+            guard let values = configured.columns.first(where: { $0.id == selected.id })?.values else { return }
+            var copy = selected
+            copy.id = "static-\(UUID().uuidString)"
+            copy.label += " (static copy)"
+            copy.calculation = ColumnCalculation(sourceID: nil, staticValues: values)
+            draft.columns.append(copy)
+            selectedColumnID = copy.id
+            selectedColumnIDs = [copy.id]
+        } catch { configurationError = error.localizedDescription }
     }
 }

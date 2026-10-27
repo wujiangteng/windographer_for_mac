@@ -130,6 +130,9 @@ struct CartesianLineChart: View {
 
     private func xTickLabelPosition(_ value: Double, index: Int, origin: CGPoint, size: CGSize) -> CGFloat {
         let raw = xPosition(value, origin: origin, size: size)
+        if xLabels != nil {
+            return raw
+        }
         if index == 0 {
             return max(raw, origin.x + 7)
         }
@@ -219,10 +222,16 @@ struct ChartSeriesLayer: View {
         ZStack(alignment: .topLeading) {
             ForEach(series) { item in
                 Path { path in
-                    for (index, point) in item.points.enumerated() {
+                    var startsSegment = true
+                    for point in item.points {
+                        guard point.x.isFinite, point.y.isFinite else {
+                            startsSegment = true
+                            continue
+                        }
                         let mapped = map(point)
-                        if index == 0 {
+                        if startsSegment {
                             path.move(to: mapped)
+                            startsSegment = false
                         } else {
                             path.addLine(to: mapped)
                         }
@@ -231,7 +240,7 @@ struct ChartSeriesLayer: View {
                 .stroke(Color.chartColor(item.colorName), lineWidth: item.name == "Measured data" ? 2.2 : 1.8)
 
                 if shouldDrawMarkers(for: item) {
-                    ForEach(item.points) { point in
+                    ForEach(item.points.filter { $0.x.isFinite && $0.y.isFinite }) { point in
                         Circle()
                             .fill(Color.white)
                             .overlay {
@@ -279,11 +288,11 @@ struct LegendView: View {
                         .frame(width: 18, height: 3)
                     Text(item.name)
                         .font(.system(size: 9))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .help(item.name)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(height: 11)
+                .frame(minHeight: 11)
             }
             Spacer(minLength: 0)
         }
@@ -325,11 +334,11 @@ struct WindRoseChart: View {
                                     .frame(width: 20, height: 3)
                                 Text(item.name)
                                     .font(.system(size: 9))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .help(item.name)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                             }
-                            .frame(height: 11)
+                            .frame(minHeight: 11)
                         }
                         Spacer(minLength: 0)
                     }
@@ -401,19 +410,9 @@ struct RoseGrid: View {
             }
             .stroke(Color(red: 0.86, green: 0.86, blue: 0.86), style: StrokeStyle(lineWidth: 0.8, dash: [4, 5]))
 
-            let innerRadius = radius * 0.25
-            Circle()
-                .fill(Color.white)
-                .overlay {
-                    Circle()
-                        .stroke(Color.black, lineWidth: 1)
-                }
-                .frame(width: innerRadius * 2, height: innerRadius * 2)
-                .position(center)
-
             Text("0 %")
                 .font(.system(size: 10))
-                .position(polarPosition(degree: 165, distance: radius * 0.25))
+                .position(x: center.x, y: center.y + 8)
             ForEach(axisTicks, id: \.self) { value in
                 Text(axisLabel(value))
                     .font(.system(size: 10))
@@ -427,9 +426,9 @@ struct RoseGrid: View {
     }
 
     private func mappedRadius(for value: Double) -> CGFloat {
-        let innerFraction = 0.25
+        // Linear radius from zero is a local display choice; native geometry is unverified.
         let normalized = min(max(value, 0), axisMax) / axisMax
-        return radius * (innerFraction + (1 - innerFraction) * normalized)
+        return radius * normalized
     }
 
     private func axisLabel(_ value: Double) -> String {
@@ -481,9 +480,8 @@ struct RoseSeries: View {
 
     private func polarPosition(degree: Double, scalar: Double) -> CGPoint {
         let angle = (degree - 90) * .pi / 180
-        let innerFraction = 0.25
         let normalized = min(max(scalar, 0), axisMax) / axisMax
-        let mappedRadius = radius * (innerFraction + (1 - innerFraction) * normalized)
+        let mappedRadius = radius * normalized
         return CGPoint(
             x: center.x + cos(angle) * mappedRadius,
             y: center.y + sin(angle) * mappedRadius
